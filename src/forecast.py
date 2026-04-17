@@ -10,6 +10,9 @@ distributions where KDE performs poorly.
 from __future__ import annotations
 
 import sqlite3
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -24,6 +27,9 @@ from config.settings import BIAS_DB, settings
 from src.utils import celsius_to_fahrenheit, http_retry, rate_limited_sleep
 
 OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+
+# Limit concurrent Open-Meteo requests across all threads
+_OPEN_METEO_SEM = threading.Semaphore(4)
 
 DEFAULT_MODEL_WEIGHTS: Dict[str, float] = {
     "icon_seamless": 1.0,
@@ -230,6 +236,19 @@ _bias_store = BiasStore()
 
 # ── Open-Meteo fetch helpers ──────────────────────────────────────────────────
 
+def _fetch_models_parallel(
+    lat: float, lon: float, target_date: date, models: List[str], variable: str
+) -> List[Tuple[str, Optional[Dict]]]:
+    """Fetch one Open-Meteo variable for multiple models concurrently."""
+    def _one(model: str) -> Tuple[str, Optional[Dict]]:
+        with _OPEN_METEO_SEM:
+            time.sleep(0.3)
+            return model, _fetch_ensemble_vars(lat, lon, target_date, model, variable)
+
+    with ThreadPoolExecutor(max_workers=min(len(models), 4)) as pool:
+        return list(pool.map(_one, models))
+
+
 @http_retry
 def _fetch_ensemble_vars(
     lat: float, lon: float, target_date: date, model: str, variables: str
@@ -331,9 +350,7 @@ def get_ensemble_forecast(
     result = EnsembleForecast(city=city, target_date=target_date)
     all_weighted: List[float] = []
 
-    for model in models:
-        rate_limited_sleep(0.3)
-        data = _fetch_ensemble_vars(lat, lon, target_date, model, "temperature_2m_max")
+    for model, data in _fetch_models_parallel(lat, lon, target_date, models, "temperature_2m_max"):
         if not data:
             continue
 
@@ -402,9 +419,7 @@ def get_precip_forecast(
     result = PrecipForecast(city=city, target_date=target_date)
     all_weighted_mm: List[float] = []
 
-    for model in models:
-        rate_limited_sleep(0.3)
-        data = _fetch_ensemble_vars(lat, lon, target_date, model, "precipitation_sum")
+    for model, data in _fetch_models_parallel(lat, lon, target_date, models, "precipitation_sum"):
         if not data:
             continue
 
@@ -467,9 +482,7 @@ def get_snow_forecast(
     result = SnowForecast(city=city, target_date=target_date)
     all_weighted_cm: List[float] = []
 
-    for model in models:
-        rate_limited_sleep(0.3)
-        data = _fetch_ensemble_vars(lat, lon, target_date, model, "snowfall_sum")
+    for model, data in _fetch_models_parallel(lat, lon, target_date, models, "snowfall_sum"):
         if not data:
             continue
 

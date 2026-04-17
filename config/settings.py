@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     ensemble_models: str = "icon_seamless,gfs_seamless,ecmwf_ifs025"
     bias_correction_days: int = 30
 
+    # ── Concurrency ─────────────────────────────────────────────────────────
+    # Max parallel city/forecast workers (increase for 50+ city scans)
+    max_concurrency: int = 10
+
     # ── Scheduler ───────────────────────────────────────────────────────────
     scan_interval_minutes: int = 30
 

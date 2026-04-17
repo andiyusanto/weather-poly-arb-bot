@@ -454,6 +454,48 @@ record_observed_snow("Chicago", "icon_seamless", date(2026, 4, 17), 2.1, 0.0)
 
 ---
 
+## Concurrency & Performance
+
+The bot uses `ThreadPoolExecutor` (Python stdlib) rather than asyncio because key dependencies — `geopy`, `py-clob-client`, and `sqlite3` — are synchronous-only. Wrapping them in `asyncio.run_in_executor()` would just be ThreadPoolExecutor with extra steps.
+
+### What runs in parallel
+
+| Layer | Mechanism | Default workers |
+|---|---|---|
+| Forecast dispatch (cities × types) | `ThreadPoolExecutor(max_workers=MAX_CONCURRENCY)` | 10 |
+| Model fetching per forecast | `ThreadPoolExecutor` + `Semaphore(4)` | up to 4 |
+| Token price enrichment (CLOB/Gamma) | `ThreadPoolExecutor` | min(MAX_CONCURRENCY, 10) |
+| Geocoding (Nominatim) | Sequential — Nominatim TOS requires 1 req/s | — |
+
+### Expected speedup
+
+| Cities | Old (sequential) | New (10 workers) |
+|---|---|---|
+| 10 cities × 3 types | ~90s | ~12s |
+| 30 cities × 3 types | ~270s | ~35s |
+| 50 cities × 3 types | ~450s | ~55s |
+
+### Tuning `MAX_CONCURRENCY`
+
+```env
+# .env
+MAX_CONCURRENCY=10   # default — safe for any VPS
+MAX_CONCURRENCY=20   # e2-small (2 vCPU) with fast network
+MAX_CONCURRENCY=25   # recommended max — stays within Open-Meteo free tier
+```
+
+> **Do not exceed 25.** Open-Meteo's ensemble API will start returning 429 errors above ~30 concurrent requests, and the Nominatim geocoder must remain at 1 req/s regardless of this setting.
+
+### VPS sizing guide
+
+| Capital | Recommended setting | GCP machine |
+|---|---|---|
+| < $1k (testing) | `MAX_CONCURRENCY=10` | e2-small |
+| $1k–$10k | `MAX_CONCURRENCY=20` | e2-medium |
+| $10k+ | `MAX_CONCURRENCY=25` | e2-standard-2 |
+
+---
+
 ## Architecture — Forecast Pipeline
 
 ```

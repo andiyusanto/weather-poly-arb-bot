@@ -8,6 +8,7 @@ Supports temperature, precipitation, and snowfall bucket markets.
 from __future__ import annotations
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from enum import Enum
@@ -513,37 +514,49 @@ def fetch_live_prices(token_ids: List[str]) -> Dict[str, Dict[str, float]]:
 
     clob = _get_clob_client()
     if clob:
+        def _fetch_clob(tid: str):
+            try:
+                ob = clob.get_order_book(tid)
+                ask = float(ob.asks[0].price) if ob.asks else 0.0
+                bid = float(ob.bids[0].price) if ob.bids else 0.0
+                return tid, {"ask": ask, "bid": bid}
+            except Exception as e:
+                logger.debug(f"CLOB price fetch failed for {tid}: {e}")
+                return tid, None
+
+        _workers = min(settings.max_concurrency, len(token_ids), 10)
         try:
-            for tid in token_ids:
-                try:
-                    ob = clob.get_order_book(tid)
-                    ask = float(ob.asks[0].price) if ob.asks else 0.0
-                    bid = float(ob.bids[0].price) if ob.bids else 0.0
-                    prices[tid] = {"ask": ask, "bid": bid}
-                    rate_limited_sleep(0.1)
-                except Exception as e:
-                    logger.debug(f"CLOB price fetch failed for {tid}: {e}")
+            with ThreadPoolExecutor(max_workers=_workers) as pool:
+                for tid, result in pool.map(_fetch_clob, token_ids):
+                    if result:
+                        prices[tid] = result
             if prices:
                 return prices
         except Exception as e:
             logger.warning(f"CLOB price fetch error: {e}")
 
+    def _fetch_gamma(tid: str):
+        try:
+            with httpx.Client(timeout=15) as client:
+                resp = client.get(
+                    f"{settings.gamma_api_host}/prices",
+                    params={"token_id": tid},
+                )
+                if resp.status_code == 200:
+                    d = resp.json()
+                    ask = float(d.get("ask", d.get("price", 0.5)))
+                    bid = float(d.get("bid", ask * 0.95))
+                    return tid, {"ask": ask, "bid": bid}
+        except Exception:
+            pass
+        return tid, None
+
+    _workers = min(settings.max_concurrency, len(token_ids), 10)
     try:
-        with httpx.Client(timeout=15) as client:
-            for tid in token_ids:
-                try:
-                    resp = client.get(
-                        f"{settings.gamma_api_host}/prices",
-                        params={"token_id": tid},
-                    )
-                    if resp.status_code == 200:
-                        d = resp.json()
-                        ask = float(d.get("ask", d.get("price", 0.5)))
-                        bid = float(d.get("bid", ask * 0.95))
-                        prices[tid] = {"ask": ask, "bid": bid}
-                    rate_limited_sleep(0.2)
-                except Exception:
-                    pass
+        with ThreadPoolExecutor(max_workers=_workers) as pool:
+            for tid, result in pool.map(_fetch_gamma, token_ids):
+                if result:
+                    prices[tid] = result
     except Exception as e:
         logger.warning(f"Gamma price fallback error: {e}")
 

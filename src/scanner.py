@@ -5,7 +5,9 @@ opportunity surfacing across temperature, precipitation, and snowfall markets.
 
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Dict, List, Optional, Tuple
@@ -206,36 +208,50 @@ def run_scan(
             if geo:
                 cities_resolved += 1
 
-    # Fetch forecasts (keyed by city + date + market_type to avoid duplicate API calls)
-    forecasts: Dict[Tuple[str, date, MarketType], Optional[AnyForecast]] = {}
-    opportunities: List[Opportunity] = []
-
+    # Collect unique (city, date, market_type) keys to avoid duplicate fetches
+    forecast_keys: Dict[Tuple[str, date, MarketType], tuple] = {}
     for market in active_markets:
         geo = city_geo.get(market.city)
         if not geo:
             logger.warning(f"No geo data for {market.city} — skipping")
             errors += 1
             continue
-
         key = (market.city, market.target_date, market.market_type)
-        if key not in forecasts:
-            try:
-                forecasts[key] = _fetch_forecast(
-                    city=market.city,
-                    lat=geo["lat"],
-                    lon=geo["lon"],
-                    target_date=market.target_date,
-                    market_type=market.market_type,
-                )
-            except Exception as e:
-                logger.error(f"Forecast error [{market.market_type.value}] {market.city}: {e}")
-                forecasts[key] = None
+        if key not in forecast_keys:
+            forecast_keys[key] = (market.city, geo["lat"], geo["lon"], market.target_date, market.market_type)
+
+    # Fetch all forecasts in parallel
+    def _fetch_key(item: tuple):
+        key, (city, lat, lon, target_date, market_type) = item
+        try:
+            return key, _fetch_forecast(city=city, lat=lat, lon=lon,
+                                        target_date=target_date, market_type=market_type)
+        except Exception as e:
+            logger.error(f"Forecast error [{market_type.value}] {city}: {e}")
+            return key, None
+
+    n_keys = len(forecast_keys)
+    workers = min(settings.max_concurrency, n_keys) if n_keys else 1
+    logger.info(f"Fetching {n_keys} forecasts with {workers} parallel workers...")
+    t_forecast = time.time()
+
+    forecasts: Dict[Tuple[str, date, MarketType], Optional[AnyForecast]] = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for key, result in pool.map(_fetch_key, list(forecast_keys.items())):
+            forecasts[key] = result
+            if result is None:
                 errors += 1
 
-        forecast = forecasts[key]
+    logger.info(f"Forecasts complete: {n_keys} fetched in {time.time() - t_forecast:.1f}s")
+
+    opportunities: List[Opportunity] = []
+    for market in active_markets:
+        if not city_geo.get(market.city):
+            continue
+        key = (market.city, market.target_date, market.market_type)
+        forecast = forecasts.get(key)
         if forecast is None:
             continue
-
         market_opps = evaluate_market(
             market, forecast, min_ev=min_ev, min_confidence=min_confidence
         )
