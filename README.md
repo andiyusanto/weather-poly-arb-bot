@@ -63,6 +63,113 @@ weather-poly-arb-bot/
 
 ---
 
+## GCP Infrastructure
+
+Polymarket applies IP-based geo-blocking beyond just the US. **Use Asia-Pacific zones.**
+
+### Confirmed blocked regions
+
+| Region | Location | Status |
+|---|---|---|
+| `us-*` | All US zones | ❌ Blocked — CFTC regulatory restriction |
+| `europe-southwest1` | Madrid, Spain | ❌ Blocked |
+| `europe-west1` | Belgium | ❌ Blocked |
+| `europe-west4` | Netherlands | ❌ Blocked |
+
+### Recommended zones
+
+| Zone | Location | Latency to Polymarket CDN | Notes |
+|---|---|---|---|
+| `asia-southeast1-b` | Singapore | ~60ms | **Best choice** — major crypto hub, reliable access |
+| `asia-northeast1-b` | Tokyo, Japan | ~80ms | Solid alternative |
+| `asia-east1-b` | Taiwan | ~70ms | Alternative |
+| `australia-southeast1-b` | Sydney | ~120ms | Fallback option |
+
+### Provisioning command (Singapore, recommended)
+
+```bash
+gcloud compute instances create polymarket-bot \
+  --zone=asia-southeast1-b \
+  --machine-type=e2-small \
+  --network-tier=STANDARD \
+  --image-family=ubuntu-2404-lts-amd64 \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=10GB \
+  --boot-disk-type=pd-standard
+```
+
+**Why e2-small?** scipy KDE scans peak at ~400MB RAM. e2-micro (1GB) risks OOM if scan + backtest run concurrently. e2-small (~$11/mo in asia-southeast1) is the safe minimum.
+
+**Why STANDARD network tier?** At 30-minute scan intervals latency is not critical — STANDARD saves ~15% vs PREMIUM with no practical difference.
+
+### Systemd service (auto-restart)
+
+```ini
+# /etc/systemd/system/polymarket-bot.service
+[Unit]
+Description=Polymarket Weather Arb Bot
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/weather-poly-arb-bot
+EnvironmentFile=/opt/weather-poly-arb-bot/.env
+ExecStart=/opt/weather-poly-arb-bot/.venv/bin/python run.py trade --dry-run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl enable --now polymarket-bot
+```
+
+### Optional: spot instance (~70% cheaper)
+
+Add `--provisioning-model=SPOT` to the provisioning command. With `Restart=always` in systemd, preemptions (typically < 1/week) are handled automatically. Brings cost to ~$3–4/mo.
+
+### Verifying a zone is not blocked
+
+Before provisioning a permanent instance, test the zone with a throwaway spot VM (~$0.002/hr):
+
+**1. Create test VM**
+```bash
+gcloud compute instances create poly-test \
+  --zone=asia-southeast1-b \
+  --machine-type=e2-micro \
+  --provisioning-model=SPOT \
+  --image-family=ubuntu-2404-lts-amd64 \
+  --image-project=ubuntu-os-cloud \
+  --boot-disk-size=10GB
+```
+
+**2. SSH in and probe both APIs**
+```bash
+gcloud compute ssh poly-test --zone=asia-southeast1-b
+
+curl -s -o /dev/null -w "Gamma API: %{http_code}\n" \
+  "https://gamma-api.polymarket.com/markets?limit=1"
+
+curl -s -o /dev/null -w "CLOB API:  %{http_code}\n" \
+  "https://clob.polymarket.com/"
+```
+
+| Response | Meaning |
+|---|---|
+| `200` | Zone is accessible — safe to use |
+| `403` | Geo-blocked — try a different zone |
+| `000` / timeout | Full block or network issue |
+
+**3. Delete the test VM**
+```bash
+gcloud compute instances delete poly-test --zone=asia-southeast1-b --quiet
+```
+
+Run steps 1–3 for each candidate zone before committing to a permanent instance.
+
+---
+
 ## Installation
 
 ### 1. Clone & virtualenv
