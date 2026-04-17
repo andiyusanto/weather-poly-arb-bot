@@ -67,29 +67,55 @@ weather-poly-arb-bot/
 
 Polymarket applies IP-based geo-blocking beyond just the US. **Use Asia-Pacific zones.**
 
-### Confirmed blocked regions
+### Blocked countries (official Polymarket policy)
 
-| Region | Location | Status |
+Source: [docs.polymarket.com/api-reference/geoblock.md](https://docs.polymarket.com/api-reference/geoblock.md)
+
+**Fully blocked** — orders rejected outright:
+Australia, Belarus, Belgium, Burundi, Central African Republic, Congo, Cuba, Ethiopia, France, Germany, Iran, Iraq, Italy, Lebanon, Libya, Myanmar, Netherlands, Nicaragua, North Korea, Russia, Somalia, South Sudan, Sudan, Syria, **United States**, US Minor Outlying Islands, UK, Venezuela, Yemen, Zimbabwe
+
+**Close-only** — can close existing positions but cannot open new ones:
+Poland, Singapore, Taiwan, Thailand
+
+**Blocked regions within countries:**
+Ontario (Canada), Crimea / Donetsk / Luhansk (Ukraine)
+
+### GCP zone impact
+
+| GCP Zone | Country | Status |
 |---|---|---|
-| `us-*` | All US zones | ❌ Blocked — CFTC regulatory restriction |
-| `europe-southwest1` | Madrid, Spain | ❌ Blocked |
-| `europe-west1` | Belgium | ❌ Blocked |
-| `europe-west4` | Netherlands | ❌ Blocked |
+| `us-*` | United States | ❌ Fully blocked |
+| `europe-west1` | Belgium | ❌ Fully blocked |
+| `europe-west4` | Netherlands | ❌ Fully blocked |
+| `europe-west2/3/6` | UK / Germany / Finland | ❌ UK/Germany fully blocked |
+| `europe-west9` | France | ❌ Fully blocked |
+| `europe-west8` | Italy | ❌ Fully blocked |
+| `europe-southwest1` | Spain | ✅ Not on blocked list |
+| `europe-north1` | Finland | ✅ Not on blocked list |
+| `asia-southeast1` | Singapore | ⚠️ Close-only |
+| `asia-northeast1` | Japan | ✅ Not on blocked list |
+| `asia-east1` | Taiwan | ⚠️ Close-only |
+| `australia-southeast1` | Australia | ❌ Fully blocked |
+
+> **Note:** "Close-only" zones (Singapore, Taiwan) mean the bot can **scan and read markets** but any live orders will be rejected. Use Japan (`asia-northeast1`) for full trading access.
+
+> Use the [zone verification steps](#verifying-a-zone-is-not-blocked) below to confirm with the geoblock API directly.
 
 ### Recommended zones
 
-| Zone | Location | Latency to Polymarket CDN | Notes |
+| Zone | Location | Status | Notes |
 |---|---|---|---|
-| `asia-southeast1-b` | Singapore | ~60ms | **Best choice** — major crypto hub, reliable access |
-| `asia-northeast1-b` | Tokyo, Japan | ~80ms | Solid alternative |
-| `asia-east1-b` | Taiwan | ~70ms | Alternative |
-| `australia-southeast1-b` | Sydney | ~120ms | Fallback option |
+| `asia-northeast1-b` | Tokyo, Japan | ✅ Full access | **Best choice** — unrestricted, well-connected |
+| `asia-northeast3-b` | Seoul, South Korea | ✅ Full access | Good alternative |
+| `europe-southwest1-a` | Madrid, Spain | ✅ Full access | EU option — Spain not on blocked list |
+| `europe-north1-b` | Finland | ✅ Full access | EU option |
+| `asia-southeast1-b` | Singapore | ⚠️ Close-only | Scan/read works; live orders rejected |
 
-### Provisioning command (Singapore, recommended)
+### Provisioning command (Tokyo, recommended)
 
 ```bash
 gcloud compute instances create polymarket-bot \
-  --zone=asia-southeast1-b \
+  --zone=asia-northeast1-b \
   --machine-type=e2-small \
   --network-tier=STANDARD \
   --image-family=ubuntu-2404-lts-amd64 \
