@@ -1,0 +1,161 @@
+# Priority / whitelist cities for weather market scanning.
+# The bot auto-discovers ALL active markets from Gamma API regardless of this list.
+# Cities listed here get geocoded first and are cached with priority=true.
+# Format: name must match what appears in Polymarket market titles (case-insensitive).
+
+priority_cities:
+  - name: "Seoul"
+    lat: 37.5665
+    lon: 126.9780
+    timezone: "Asia/Seoul"
+    country: "KR"
+
+  - name: "Hong Kong"
+    lat: 22.3193
+    lon: 114.1694
+    timezone: "Asia/Hong_Kong"
+    country: "HK"
+
+  - name: "Shanghai"
+    lat: 31.2304
+    lon: 121.4737
+    timezone: "Asia/Shanghai"
+    country: "CN"
+
+  - name: "Paris"
+    lat: 48.8566
+    lon: 2.3522
+    timezone: "Europe/Paris"
+    country: "FR"
+
+  - name: "New York"
+    lat: 40.7128
+    lon: -74.0060
+    timezone: "America/New_York"
+    country: "US"
+
+  - name: "Wellington"
+    lat: -41.2866
+    lon: 174.7756
+    timezone: "Pacific/Auckland"
+    country: "NZ"
+
+  - name: "Tokyo"
+    lat: 35.6762
+    lon: 139.6503
+    timezone: "Asia/Tokyo"
+    country: "JP"
+
+  - name: "London"
+    lat: 51.5074
+    lon: -0.1278
+    timezone: "Europe/London"
+    country: "GB"
+
+  - name: "Buenos Aires"
+    lat: -34.6037
+    lon: -58.3816
+    timezone: "America/Argentina/Buenos_Aires"
+    country: "AR"
+
+  - name: "Mexico City"
+    lat: 19.4326
+    lon: -99.1332
+    timezone: "America/Mexico_City"
+    country: "MX"
+
+  - name: "Austin"
+    lat: 30.2672
+    lon: -97.7431
+    timezone: "America/Chicago"
+    country: "US"
+
+  - name: "Warsaw"
+    lat: 52.2297
+    lon: 21.0122
+    timezone: "Europe/Warsaw"
+    country: "PL"
+
+  - name: "Toronto"
+    lat: 43.6532
+    lon: -79.3832
+    timezone: "America/Toronto"
+    country: "CA"
+
+  - name: "Atlanta"
+    lat: 33.7490
+    lon: -84.3880
+    timezone: "America/New_York"
+    country: "US"
+
+  - name: "Miami"
+    lat: 25.7617
+    lon: -80.1918
+    timezone: "America/New_York"
+    country: "US"
+
+  - name: "Los Angeles"
+    lat: 34.0522
+    lon: -118.2437
+    timezone: "America/Los_Angeles"
+    country: "US"
+
+  - name: "Chicago"
+    lat: 41.8781
+    lon: -87.6298
+    timezone: "America/Chicago"
+    country: "US"
+
+  - name: "Sydney"
+    lat: -33.8688
+    lon: 151.2093
+    timezone: "Australia/Sydney"
+    country: "AU"
+
+  - name: "Dubai"
+    lat: 25.2048
+    lon: 55.2708
+    timezone: "Asia/Dubai"
+    country: "AE"
+
+  - name: "Singapore"
+    lat: 1.3521
+    lon: 103.8198
+    timezone: "Asia/Singapore"
+    country: "SG"
+
+  - name: "Berlin"
+    lat: 52.5200
+    lon: 13.4050
+    timezone: "Europe/Berlin"
+    country: "DE"
+
+  - name: "Madrid"
+    lat: 40.4168
+    lon: -3.7038
+    timezone: "Europe/Madrid"
+    country: "ES"
+
+  - name: "Mumbai"
+    lat: 19.0760
+    lon: 72.8777
+    timezone: "Asia/Kolkata"
+    country: "IN"
+
+  - name: "Bangkok"
+    lat: 13.7563
+    lon: 100.5018
+    timezone: "Asia/Bangkok"
+    country: "TH"
+
+  - name: "Cairo"
+    lat: 30.0444
+    lon: 31.2357
+    timezone: "Africa/Cairo"
+    country: "EG"
+
+# Temperature bucket width in °F (most Polymarket markets use 5°F buckets)
+bucket_width_f: 5
+
+# Temperature unit used on Polymarket (fahrenheit or celsius)
+market_temp_unit: fahrenheit
