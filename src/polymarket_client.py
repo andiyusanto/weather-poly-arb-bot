@@ -18,7 +18,7 @@ import httpx
 from loguru import logger
 
 from config.settings import settings
-from src.utils import http_retry, rate_limited_sleep
+from src.utils import celsius_to_fahrenheit, http_retry, rate_limited_sleep
 
 
 # ── Market type classification ────────────────────────────────────────────────
@@ -89,126 +89,81 @@ class WeatherMarket:
 
 # ── Regex patterns ────────────────────────────────────────────────────────────
 
-# ── Temperature ──
+# Temperature: "Will the highest temperature in {CITY} be {BUCKET} on {MONTH DAY}?"
 _TEMP_TITLE_RE = re.compile(
-    r"(?:highest|high)\s+temperature\s+in\s+(?P<city>[^,\n]+?)\s+on\s+(?P<date>\w+\s+\d+,?\s*\d{4})",
+    r"Will the highest temperature in (?P<city>[A-Za-z][A-Za-z\s]+?) be "
+    r"(?P<bucket>[^?]+?) on (?P<date>[A-Za-z]+ \d+)\?",
     re.IGNORECASE,
 )
 
-# ── Precipitation ──
+# Precipitation: "Will {CITY} have {BUCKET} of precipitation in {MONTH}?"
 _PRECIP_TITLE_RE = re.compile(
-    r"(?:precipitation|rainfall?|rain|total\s+precip)\s+(?:in\s+)?(?P<city>[^,\n]+?)\s+on\s+(?P<date>\w+\s+\d+,?\s*\d{4})"
-    r"|(?P<city2>[^,\n]+?)\s+(?:precipitation|rainfall?)\s+on\s+(?P<date2>\w+\s+\d+,?\s*\d{4})",
-    re.IGNORECASE,
-)
-_PRECIP_KEYWORD_RE = re.compile(
-    r"\b(?:precipitation|rainfall?|total\s+rain|total\s+precip|precip\s+≥|precip\s+>=)\b",
+    r"Will (?P<city>[A-Za-z][A-Za-z\s,]+?) have (?P<bucket>[^?]+?) "
+    r"(?:of )?precipitation in (?P<date>[A-Za-z]+ ?\d*)\?",
     re.IGNORECASE,
 )
 
-# ── Snowfall ──
+# Snowfall: "Will {CITY} have {BUCKET} of snowfall in {MONTH}?"
 _SNOW_TITLE_RE = re.compile(
-    r"(?:snowfall?|snow\s+accumulation|total\s+snow)\s+(?:in\s+)?(?P<city>[^,\n]+?)\s+on\s+(?P<date>\w+\s+\d+,?\s*\d{4})"
-    r"|(?P<city2>[^,\n]+?)\s+(?:snowfall?|snow)\s+on\s+(?P<date2>\w+\s+\d+,?\s*\d{4})",
-    re.IGNORECASE,
-)
-_SNOW_KEYWORD_RE = re.compile(
-    r"\b(?:snowfall?|snow\s+accumulation|total\s+snow|inches\s+of\s+snow|cm\s+of\s+snow)\b",
+    r"Will (?P<city>[A-Za-z][A-Za-z\s,]+?) have (?P<bucket>[^?]+?) "
+    r"(?:of )?(?:snowfall|snow) in (?P<date>[A-Za-z]+ ?\d*)\?",
     re.IGNORECASE,
 )
 
-# ── Bucket boundary regexes (shared) ──
-_RANGE_RE    = re.compile(r"(?P<lo>\d+(?:\.\d+)?)\s*[-–to]+\s*(?P<hi>\d+(?:\.\d+)?)", re.IGNORECASE)
-_ABOVE_RE    = re.compile(r"(?:above|over|>\s*|≥\s*|>=\s*)(?P<lo>\d+(?:\.\d+)?)", re.IGNORECASE)
-_BELOW_RE    = re.compile(r"(?:below|under|<\s*|≤\s*|<=\s*)(?P<hi>\d+(?:\.\d+)?)", re.IGNORECASE)
-_EXACT_RE    = re.compile(r"^(?P<v>\d+(?:\.\d+)?)\s*(?:mm|cm|in(?:ch(?:es)?)?|°[Ff])?$", re.IGNORECASE)
-_INCH_MM     = 25.4   # 1 inch in mm
-_INCH_CM     = 2.54   # 1 inch in cm (snow)
+# Shared helpers
+_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)")
+_INCH_MM  = 25.4
+_INCH_CM  = 2.54
 
 
 # ── Date parser ───────────────────────────────────────────────────────────────
 
 def _parse_date(s: str) -> Optional[date]:
+    from datetime import timedelta
     s = s.replace(",", "").strip()
-    for fmt in ("%B %d %Y", "%b %d %Y", "%B %d, %Y", "%b %d, %Y"):
+    # With year
+    for fmt in ("%B %d %Y", "%b %d %Y"):
         try:
             return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    # Month + day, no year — infer year from today
+    for fmt in ("%B %d", "%b %d"):
+        try:
+            parsed = datetime.strptime(s, fmt)
+            today = date.today()
+            result = parsed.replace(year=today.year).date()
+            if result < today - timedelta(days=1):
+                result = result.replace(year=today.year + 1)
+            return result
+        except ValueError:
+            continue
+    # Month only (for monthly precipitation markets) — return last day of month
+    for fmt in ("%B %Y", "%b %Y", "%B", "%b"):
+        try:
+            parsed = datetime.strptime(s, fmt)
+            today = date.today()
+            year = parsed.year if parsed.year != 1900 else today.year
+            month = parsed.month
+            # last day of that month
+            import calendar
+            last_day = calendar.monthrange(year, month)[1]
+            result = date(year, month, last_day)
+            if result < today - timedelta(days=1):
+                result = date(year + 1, month, last_day)
+            return result
         except ValueError:
             continue
     return None
 
 
-# ── Temperature bucket parser ─────────────────────────────────────────────────
-
-def _parse_temp_bucket(label: str) -> Optional[Tuple[float, float]]:
-    m = _RANGE_RE.search(label)
-    if m:
-        return float(m.group("lo")), float(m.group("hi"))
-    m = _ABOVE_RE.search(label)
-    if m:
-        return float(m.group("lo")), 9999.0
-    m = _BELOW_RE.search(label)
-    if m:
-        return -9999.0, float(m.group("hi"))
-    return None
-
-
-# ── Precipitation bucket parser (normalises to mm) ────────────────────────────
+# ── Unit converters ───────────────────────────────────────────────────────────
 
 def _to_mm(value: float, label: str) -> float:
-    """Convert value to mm if label suggests inches."""
     if re.search(r"\bin(?:ch(?:es)?)?\b", label, re.IGNORECASE):
         return value * _INCH_MM
     return value
 
-
-def _parse_precip_bucket(label: str) -> Optional[Tuple[float, float]]:
-    """
-    Parse a precip outcome label into (lower_mm, upper_mm).
-    Returns (0.0, 0.01) for 'No rain' / 'Dry' / '0 mm' type labels.
-    """
-    clean = label.strip()
-
-    # "No rain", "Dry", "No precipitation"
-    if re.search(r"\b(?:no\s+(?:rain|precip\w*)|dry|zero\s+precip)\b", clean, re.IGNORECASE):
-        return 0.0, 0.01
-
-    # "Any precipitation" / "Yes (rain)" binary YES outcome → treat as ≥0.01
-    if re.search(r"\b(?:any\s+precip\w*|yes|rain(?:y)?)\b", clean, re.IGNORECASE):
-        return 0.01, 9999.0
-
-    # Exact zero: "0 mm", "0.00 mm", "0 in"
-    m = _EXACT_RE.match(clean)
-    if m and float(m.group("v")) == 0.0:
-        return 0.0, 0.01
-
-    m = _RANGE_RE.search(clean)
-    if m:
-        lo = _to_mm(float(m.group("lo")), clean)
-        hi = _to_mm(float(m.group("hi")), clean)
-        return lo, hi
-
-    m = _ABOVE_RE.search(clean)
-    if m:
-        lo = _to_mm(float(m.group("lo")), clean)
-        return lo, 9999.0
-
-    m = _BELOW_RE.search(clean)
-    if m:
-        hi = _to_mm(float(m.group("hi")), clean)
-        # "< 1 mm" typically includes zero
-        return 0.0, hi
-
-    # Single value "≥ 1 mm" already handled by ABOVE_RE; catch plain "1 mm"
-    m = _EXACT_RE.match(clean)
-    if m:
-        v = _to_mm(float(m.group("v")), clean)
-        return v, v + 1.0  # treat single value as 1-unit wide bucket
-
-    return None
-
-
-# ── Snowfall bucket parser (normalises to cm) ─────────────────────────────────
 
 def _to_cm(value: float, label: str) -> float:
     if re.search(r"\bin(?:ch(?:es)?)?\b", label, re.IGNORECASE):
@@ -216,159 +171,163 @@ def _to_cm(value: float, label: str) -> float:
     return value
 
 
-def _parse_snow_bucket(label: str) -> Optional[Tuple[float, float]]:
-    """Parse a snowfall outcome label into (lower_cm, upper_cm)."""
-    clean = label.strip()
+# ── Bucket parsers (from question title) ──────────────────────────────────────
 
-    if re.search(r"\b(?:no\s+snow|zero\s+snow|dry|0\s*cm|0\s*in)\b", clean, re.IGNORECASE):
-        return 0.0, 0.01
+def _parse_temp_bucket_from_question(bucket_str: str) -> Optional[Tuple[float, float]]:
+    """
+    Parse temperature range from the bucket portion of a title like:
+      'between 80-81°F', '84°F or higher', '65°F or below', '22°C', '22°C or higher'
+    Always returns values in °F (converts °C if needed).
+    """
+    is_celsius = bool(re.search(r"°\s*[Cc]", bucket_str))
 
-    if re.search(r"\b(?:any\s+snow|yes|snowy?)\b", clean, re.IGNORECASE):
-        return 0.01, 9999.0
-
-    m = _EXACT_RE.match(clean)
-    if m and float(m.group("v")) == 0.0:
-        return 0.0, 0.01
-
-    m = _RANGE_RE.search(clean)
+    # Range: "80-81" or "between 80-81"
+    m = _RANGE_RE.search(bucket_str)
     if m:
-        lo = _to_cm(float(m.group("lo")), clean)
-        hi = _to_cm(float(m.group("hi")), clean)
+        lo, hi = float(m.group(1)), float(m.group(2))
+        if is_celsius:
+            lo, hi = celsius_to_fahrenheit(lo), celsius_to_fahrenheit(hi)
         return lo, hi
 
-    m = _ABOVE_RE.search(clean)
-    if m:
-        lo = _to_cm(float(m.group("lo")), clean)
-        return lo, 9999.0
+    # "or higher" / "or above"
+    if re.search(r"or\s+(?:higher|above)", bucket_str, re.IGNORECASE):
+        m2 = re.search(r"(\d+(?:\.\d+)?)", bucket_str)
+        if m2:
+            v = float(m2.group(1))
+            return (celsius_to_fahrenheit(v) if is_celsius else v), 9999.0
 
-    m = _BELOW_RE.search(clean)
-    if m:
-        hi = _to_cm(float(m.group("hi")), clean)
-        return 0.0, hi
+    # "or below"
+    if re.search(r"or\s+below", bucket_str, re.IGNORECASE):
+        m2 = re.search(r"(\d+(?:\.\d+)?)", bucket_str)
+        if m2:
+            v = float(m2.group(1))
+            return -9999.0, (celsius_to_fahrenheit(v) if is_celsius else v)
 
-    m = _EXACT_RE.match(clean)
-    if m:
-        v = _to_cm(float(m.group("v")), clean)
+    # Exact value: "22°C" or "68°F"
+    m2 = re.search(r"(\d+(?:\.\d+)?)", bucket_str)
+    if m2:
+        v = float(m2.group(1))
+        if is_celsius:
+            return celsius_to_fahrenheit(v), celsius_to_fahrenheit(v + 1)
         return v, v + 1.0
 
     return None
 
 
-# ── Market type classifier ────────────────────────────────────────────────────
+def _parse_precip_bucket_from_question(bucket_str: str) -> Optional[Tuple[float, float]]:
+    """
+    Parse precipitation range from the bucket portion of a title like:
+      'less than 2 inches', 'between 2 and 3 inches', 'more than 6 inches',
+      'less than 20mm', 'between 20-30mm', '70mm or more'
+    Returns (lower_mm, upper_mm).
+    """
+    clean = bucket_str.strip()
 
-def _classify_market(question: str, search_term: str) -> Optional[Tuple[MarketType, str, date]]:
+    if re.search(r"\b(?:less than|below|under)\b", clean, re.IGNORECASE):
+        m = re.search(r"(\d+(?:\.\d+)?)", clean)
+        if m:
+            return 0.0, _to_mm(float(m.group(1)), clean)
+
+    if re.search(r"\b(?:more than|or more|over|above)\b", clean, re.IGNORECASE):
+        m = re.search(r"(\d+(?:\.\d+)?)", clean)
+        if m:
+            return _to_mm(float(m.group(1)), clean), 9999.0
+
+    # "between N and M" (words)
+    m = re.search(r"between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)", clean, re.IGNORECASE)
+    if m:
+        return _to_mm(float(m.group(1)), clean), _to_mm(float(m.group(2)), clean)
+
+    # "N-M" numeric range
+    m = _RANGE_RE.search(clean)
+    if m:
+        return _to_mm(float(m.group(1)), clean), _to_mm(float(m.group(2)), clean)
+
+    return None
+
+
+def _parse_snow_bucket_from_question(bucket_str: str) -> Optional[Tuple[float, float]]:
     """
-    Returns (MarketType, city, date) or None if unparseable.
-    Tries temperature → precipitation → snowfall in priority order.
+    Parse snowfall range from the bucket portion of a title.
+    Returns (lower_cm, upper_cm).
     """
-    # Temperature
-    m = _TEMP_TITLE_RE.search(question)
+    clean = bucket_str.strip()
+
+    if re.search(r"\b(?:less than|below|under)\b", clean, re.IGNORECASE):
+        m = re.search(r"(\d+(?:\.\d+)?)", clean)
+        if m:
+            return 0.0, _to_cm(float(m.group(1)), clean)
+
+    if re.search(r"\b(?:more than|or more|over|above)\b", clean, re.IGNORECASE):
+        m = re.search(r"(\d+(?:\.\d+)?)", clean)
+        if m:
+            return _to_cm(float(m.group(1)), clean), 9999.0
+
+    m = re.search(r"between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)", clean, re.IGNORECASE)
+    if m:
+        return _to_cm(float(m.group(1)), clean), _to_cm(float(m.group(2)), clean)
+
+    m = _RANGE_RE.search(clean)
+    if m:
+        return _to_cm(float(m.group(1)), clean), _to_cm(float(m.group(2)), clean)
+
+    return None
+
+
+# ── Market classifier (returns type + city + date + bucket range) ─────────────
+
+def _classify_market(
+    question: str,
+) -> Optional[Tuple[MarketType, str, date, str, Tuple[float, float]]]:
+    """
+    Parse a Polymarket weather question.
+    Returns (MarketType, city, target_date, bucket_label, (lower, upper)) or None.
+    """
+    # Temperature: "Will the highest temperature in {CITY} be {BUCKET} on {DATE}?"
+    m = _TEMP_TITLE_RE.match(question)
     if m:
         d = _parse_date(m.group("date"))
-        if d:
-            return MarketType.TEMPERATURE, m.group("city").strip().title(), d
+        bucket_str = m.group("bucket").strip()
+        bucket = _parse_temp_bucket_from_question(bucket_str)
+        if d and bucket:
+            return MarketType.TEMPERATURE, m.group("city").strip().title(), d, bucket_str, bucket
 
-    # Precipitation
-    if _PRECIP_KEYWORD_RE.search(question) or "precipitation" in search_term or "rain" in search_term:
-        m = _PRECIP_TITLE_RE.search(question)
-        if m:
-            city = (m.group("city") or m.group("city2") or "").strip().title()
-            raw_date = (m.group("date") or m.group("date2") or "").strip()
-            d = _parse_date(raw_date)
-            if city and d:
-                return MarketType.PRECIPITATION, city, d
+    # Precipitation: "Will {CITY} have {BUCKET} of precipitation in {MONTH}?"
+    m = _PRECIP_TITLE_RE.match(question)
+    if m:
+        d = _parse_date(m.group("date"))
+        bucket_str = m.group("bucket").strip()
+        bucket = _parse_precip_bucket_from_question(bucket_str)
+        if d and bucket:
+            return MarketType.PRECIPITATION, m.group("city").strip().title(), d, bucket_str, bucket
 
-        # Fallback: any market with precipitation keyword + parseable city/date
-        if _PRECIP_KEYWORD_RE.search(question):
-            # Try generic "in CITY on DATE" extraction
-            m2 = re.search(
-                r"\bin\s+(?P<city>[A-Z][a-zA-Z\s]+?)\s+on\s+(?P<date>\w+\s+\d+,?\s*\d{4})",
-                question, re.IGNORECASE,
-            )
-            if m2:
-                d = _parse_date(m2.group("date"))
-                if d:
-                    return MarketType.PRECIPITATION, m2.group("city").strip().title(), d
-
-    # Snowfall
-    if _SNOW_KEYWORD_RE.search(question) or "snow" in search_term:
-        m = _SNOW_TITLE_RE.search(question)
-        if m:
-            city = (m.group("city") or m.group("city2") or "").strip().title()
-            raw_date = (m.group("date") or m.group("date2") or "").strip()
-            d = _parse_date(raw_date)
-            if city and d:
-                return MarketType.SNOWFALL, city, d
-
-        if _SNOW_KEYWORD_RE.search(question):
-            m2 = re.search(
-                r"\bin\s+(?P<city>[A-Z][a-zA-Z\s]+?)\s+on\s+(?P<date>\w+\s+\d+,?\s*\d{4})",
-                question, re.IGNORECASE,
-            )
-            if m2:
-                d = _parse_date(m2.group("date"))
-                if d:
-                    return MarketType.SNOWFALL, m2.group("city").strip().title(), d
+    # Snowfall: "Will {CITY} have {BUCKET} of snowfall in {MONTH}?"
+    m = _SNOW_TITLE_RE.match(question)
+    if m:
+        d = _parse_date(m.group("date"))
+        bucket_str = m.group("bucket").strip()
+        bucket = _parse_snow_bucket_from_question(bucket_str)
+        if d and bucket:
+            return MarketType.SNOWFALL, m.group("city").strip().title(), d, bucket_str, bucket
 
     return None
 
 
 # ── Gamma API discovery ───────────────────────────────────────────────────────
 
-# All search terms to scan; mapped to a hint for classifier
-_SEARCH_TERMS: Dict[str, str] = {
-    "highest temperature": "temperature",
-    "high temperature": "temperature",
-    "precipitation in": "precipitation",
-    "total precipitation": "precipitation",
-    "rainfall in": "precipitation",
-    "rain in": "precipitation",
-    "precipitation >=": "precipitation",
-    "precipitation ≥": "precipitation",
-    "snowfall in": "snowfall",
-    "total snowfall": "snowfall",
-    "snow in": "snowfall",
-    "inches of snow": "snowfall",
-}
-
-
-def _parse_buckets_for_type(
-    market_type: MarketType,
-    tokens: list,
-) -> List[WeatherBucket]:
-    buckets: List[WeatherBucket] = []
-    for tok in tokens:
-        if isinstance(tok, str):
-            outcome_label, token_id = tok, ""
-        else:
-            outcome_label = tok.get("outcome", tok.get("label", ""))
-            token_id = tok.get("token_id", tok.get("id", ""))
-
-        if market_type == MarketType.TEMPERATURE:
-            parsed = _parse_temp_bucket(outcome_label)
-        elif market_type == MarketType.PRECIPITATION:
-            parsed = _parse_precip_bucket(outcome_label)
-        else:
-            parsed = _parse_snow_bucket(outcome_label)
-
-        if parsed:
-            buckets.append(WeatherBucket(
-                token_id=token_id,
-                outcome_label=outcome_label,
-                lower=parsed[0],
-                upper=parsed[1],
-            ))
-    return buckets
-
-
 @http_retry
 def fetch_weather_markets(
-    limit: int = 200,
     enabled_types: Optional[set] = None,
+    **_kwargs,
 ) -> List[WeatherMarket]:
     """
-    Query Gamma API for all active weather markets (temperature + precipitation + snowfall).
-    Filters by enabled_types (default: all from settings).
+    Fetch active weather markets from Gamma API.
+
+    Polymarket weather markets resolve daily/monthly and appear near offset 2000+
+    in the default (volume-sorted) listing. The q= search param does NOT perform
+    keyword filtering — it re-ranks results by relevance but still returns all
+    markets, causing weather markets to be buried. Instead we scan without a
+    search filter and stop once we've seen enough consecutive non-weather pages.
     """
     if enabled_types is None:
         enabled_types = settings.enabled_market_type_set
@@ -376,107 +335,106 @@ def fetch_weather_markets(
     markets: List[WeatherMarket] = []
     seen_ids: set = set()
 
-    MAX_PAGES_PER_TERM = 20  # hard cap: 20 × 100 = 2000 markets per search term
+    MAX_PAGES = 80          # 80 × 100 = 8 000 markets scanned at most
+    STOP_AFTER_EMPTY = 15   # stop if 15 consecutive pages yield zero weather matches
 
-    for term, hint in _SEARCH_TERMS.items():
-        # Skip terms for disabled market types
-        if hint not in enabled_types:
-            continue
+    offset = 0
+    consecutive_empty = 0
 
-        offset = 0
-        page = 0
-        term_matched = 0
-        while page < MAX_PAGES_PER_TERM:
-            url = f"{settings.gamma_api_host}/markets"
-            params = {
-                "limit": min(limit, 100),
-                "offset": offset,
-                "active": "true",
-                "closed": "false",
-                "q": term,
-            }
-            try:
-                with httpx.Client(timeout=20) as client:
-                    resp = client.get(url, params=params)
-                    resp.raise_for_status()
-                    data = resp.json()
-            except Exception as e:
-                logger.error(f"Gamma API fetch failed [{term}] page {page}: {e}")
+    for page in range(MAX_PAGES):
+        url = f"{settings.gamma_api_host}/markets"
+        params = {
+            "limit": 100,
+            "offset": offset,
+            "active": "true",
+            "closed": "false",
+        }
+        try:
+            with httpx.Client(timeout=20) as client:
+                resp = client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+        except Exception as e:
+            logger.error(f"Gamma API fetch failed page {page}: {e}")
+            break
+
+        items = data if isinstance(data, list) else data.get("markets", data.get("data", []))
+        if not items:
+            break
+
+        page_matched = 0
+        for item in items:
+            market_id = item.get("conditionId") or item.get("id", "")
+            if not market_id or market_id in seen_ids:
+                continue
+
+            question = item.get("question", "") or item.get("title", "")
+            classification = _classify_market(question)
+            if not classification:
+                continue
+
+            market_type, city, target_date, bucket_label, (lower, upper) = classification
+            if market_type.value not in enabled_types:
+                continue
+
+            seen_ids.add(market_id)
+
+            # Resolution time
+            res_time = None
+            for key in ("endDate", "end_date", "resolveTime", "resolution_time"):
+                if item.get(key):
+                    try:
+                        ts = item[key]
+                        if isinstance(ts, (int, float)):
+                            res_time = datetime.fromtimestamp(ts, tz=timezone.utc)
+                        else:
+                            res_time = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                    except Exception:
+                        pass
+                    if res_time:
+                        break
+
+            # Each Polymarket weather market is a binary Yes/No market.
+            # clobTokenIds[0] = Yes token, clobTokenIds[1] = No token.
+            clob_ids = item.get("clobTokenIds", [])
+            yes_token_id = clob_ids[0] if clob_ids else ""
+
+            bucket = WeatherBucket(
+                token_id=yes_token_id,
+                outcome_label=bucket_label,
+                lower=lower,
+                upper=upper,
+            )
+
+            vol = float(item.get("volume", item.get("volumeNum", 0)) or 0)
+            markets.append(WeatherMarket(
+                market_id=market_id,
+                question=question,
+                city=city,
+                target_date=target_date,
+                resolution_datetime=res_time,
+                market_type=market_type,
+                buckets=[bucket],
+                total_volume_usdc=vol,
+            ))
+            page_matched += 1
+
+        logger.debug(f"Page {page} (offset {offset}): {len(items)} items, {page_matched} weather matched")
+
+        if page_matched == 0:
+            consecutive_empty += 1
+            if consecutive_empty >= STOP_AFTER_EMPTY:
+                logger.info(f"No weather markets in {STOP_AFTER_EMPTY} consecutive pages — stopping scan")
                 break
+        else:
+            consecutive_empty = 0
 
-            items = data if isinstance(data, list) else data.get("markets", data.get("data", []))
-            logger.debug(f"[{term}] page {page}: {len(items)} items from API")
-            if not items:
-                break
+        if len(items) < 100:
+            break
+        offset += 100
+        rate_limited_sleep(0.3)
 
-            for item in items:
-                market_id = item.get("conditionId") or item.get("id", "")
-                if not market_id or market_id in seen_ids:
-                    continue
-
-                question = item.get("question", "") or item.get("title", "")
-                classification = _classify_market(question, hint)
-
-                if not classification:
-                    # Try description field as fallback
-                    question = item.get("description", "")
-                    classification = _classify_market(question, hint)
-
-                if not classification:
-                    continue
-
-                market_type, city, target_date = classification
-
-                # Respect enabled_types filter
-                if market_type.value not in enabled_types:
-                    continue
-
-                seen_ids.add(market_id)
-
-                # Parse resolution time
-                res_time = None
-                for key in ("endDate", "end_date", "resolveTime", "resolution_time"):
-                    if item.get(key):
-                        try:
-                            ts = item[key]
-                            if isinstance(ts, (int, float)):
-                                res_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-                            else:
-                                res_time = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                        except Exception:
-                            pass
-                        if res_time:
-                            break
-
-                tokens = item.get("tokens", item.get("outcomes", []))
-                buckets = _parse_buckets_for_type(market_type, tokens)
-
-                if not buckets:
-                    logger.debug(f"Skipping [{market_type.value}] {question}: no parseable buckets")
-                    continue
-
-                vol = float(item.get("volume", item.get("volumeNum", 0)) or 0)
-                markets.append(WeatherMarket(
-                    market_id=market_id,
-                    question=question,
-                    city=city,
-                    target_date=target_date,
-                    resolution_datetime=res_time,
-                    market_type=market_type,
-                    buckets=buckets,
-                    total_volume_usdc=vol,
-                ))
-                term_matched += 1
-
-            if len(items) < params["limit"]:
-                break
-            page += 1
-            offset += params["limit"]
-            rate_limited_sleep(0.5)
-
-        logger.info(f"[{term}] scanned {page + 1} page(s), matched {term_matched} markets")
-
-    by_type = {}
+    by_type: Dict[str, int] = {}
     for m in markets:
         by_type[m.market_type.value] = by_type.get(m.market_type.value, 0) + 1
     logger.info(
