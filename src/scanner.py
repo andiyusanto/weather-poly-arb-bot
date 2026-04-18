@@ -179,7 +179,7 @@ def run_scan(
     for m in markets:
         if m.resolution_datetime:
             h = hours_until(m.resolution_datetime)
-            if h < -6:
+            if h < -48:
                 logger.debug(f"Skipping {m.city}/{m.market_type.value} (resolved {-h:.0f}h ago)")
                 continue
             if h > max_hours:

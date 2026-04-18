@@ -275,10 +275,14 @@ def _fetch_ensemble_vars(
         daily = data.get("daily", {})
         result: Dict[str, List[float]] = {}
         for key, values in daily.items():
-            if values:
-                val = values[0]
-                if val is not None:
+            if key == "time" or not values:
+                continue
+            val = values[0]
+            if val is not None:
+                try:
                     result.setdefault(key.split("_member")[0], []).append(float(val))
+                except (TypeError, ValueError):
+                    pass
 
         return result if result else None
     except Exception as e:
