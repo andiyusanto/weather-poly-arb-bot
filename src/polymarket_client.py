@@ -336,7 +336,7 @@ def fetch_weather_markets(
     seen_ids: set = set()
 
     MAX_PAGES = 80           # 80 × 100 = 8 000 markets scanned at most
-    MIN_PAGES = 30           # always scan at least 3 000 items before early-exit
+    MIN_PAGES = 60           # always scan at least 3 000 items before early-exit
     STOP_AFTER_EMPTY = 15    # stop if 15 consecutive pages yield zero weather matches after MIN_PAGES
 
     offset = 0
