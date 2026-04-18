@@ -249,6 +249,8 @@ def _fetch_models_parallel(
         return list(pool.map(_one, models))
 
 
+_MAX_FORECAST_DAYS = 16  # Open-Meteo ensemble horizon
+
 @http_retry
 def _fetch_ensemble_vars(
     lat: float, lon: float, target_date: date, model: str, variables: str
@@ -257,6 +259,11 @@ def _fetch_ensemble_vars(
     Generic Open-Meteo ensemble fetch.
     Returns {variable_key: [member_values]} or None on failure.
     """
+    days_ahead = (target_date - date.today()).days
+    if days_ahead > _MAX_FORECAST_DAYS:
+        logger.debug(f"Skipping {model}/{variables} for {target_date} ({days_ahead}d > {_MAX_FORECAST_DAYS}d horizon)")
+        return None
+
     params = {
         "latitude": lat,
         "longitude": lon,
