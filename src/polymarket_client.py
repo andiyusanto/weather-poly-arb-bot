@@ -315,19 +315,59 @@ def _classify_market(
 
 # ── Gamma API discovery ───────────────────────────────────────────────────────
 
+# Maps MarketType → Gamma events tag_slug
+_TAG_SLUG: Dict[str, str] = {
+    MarketType.TEMPERATURE.value:   "temperature",
+    MarketType.PRECIPITATION.value: "precipitation",
+    MarketType.SNOWFALL.value:      "snowfall",
+}
+
+
+def _parse_clob_ids(raw) -> List[str]:
+    """clobTokenIds arrives as a JSON string or a list; normalise to list."""
+    import json as _json
+    if isinstance(raw, str):
+        try:
+            return _json.loads(raw)
+        except Exception:
+            return []
+    return raw or []
+
+
+def _parse_res_time(raw) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        if isinstance(raw, (int, float)):
+            return datetime.fromtimestamp(raw, tz=timezone.utc)
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _events_page(tag_slug: str, offset: int) -> List[dict]:
+    """Fetch one page of events from the Gamma /events endpoint."""
+    url = f"{settings.gamma_api_host}/events"
+    params = {"limit": 100, "offset": offset, "tag_slug": tag_slug, "closed": "false"}
+    with httpx.Client(timeout=20) as client:
+        resp = client.get(url, params=params)
+        resp.raise_for_status()
+        data = resp.json()
+    return data if isinstance(data, list) else data.get("events", [])
+
+
 @http_retry
 def fetch_weather_markets(
     enabled_types: Optional[set] = None,
     **_kwargs,
 ) -> List[WeatherMarket]:
     """
-    Fetch active weather markets from Gamma API.
+    Fetch active weather markets from the Gamma /events endpoint.
 
-    Polymarket weather markets resolve daily/monthly and appear near offset 2000+
-    in the default (volume-sorted) listing. The q= search param does NOT perform
-    keyword filtering — it re-ranks results by relevance but still returns all
-    markets, causing weather markets to be buried. Instead we scan without a
-    search filter and stop once we've seen enough consecutive non-weather pages.
+    Polymarket exposes weather events via tag_slug filters (temperature,
+    precipitation, snowfall). Each event contains embedded binary markets —
+    one per temperature/precipitation bucket. This is far more efficient
+    than scanning all 50 000+ markets on the /markets endpoint.
     """
     if enabled_types is None:
         enabled_types = settings.enabled_market_type_set
@@ -335,108 +375,79 @@ def fetch_weather_markets(
     markets: List[WeatherMarket] = []
     seen_ids: set = set()
 
-    MAX_PAGES = 80           # 80 × 100 = 8 000 markets scanned at most
-    MIN_PAGES = 100           # always scan at least 3 000 items before early-exit
-    STOP_AFTER_EMPTY = 15    # stop if 15 consecutive pages yield zero weather matches after MIN_PAGES
+    for mtype in MarketType:
+        if mtype.value not in enabled_types:
+            continue
 
-    offset = 0
-    consecutive_empty = 0
+        tag_slug = _TAG_SLUG[mtype.value]
+        offset = 0
+        event_count = 0
 
-    for page in range(MAX_PAGES):
-        url = f"{settings.gamma_api_host}/markets"
-        params = {
-            "limit": 100,
-            "offset": offset,
-            "active": "true",
-            "closed": "false",
-        }
-        try:
-            with httpx.Client(timeout=20) as client:
-                resp = client.get(url, params=params)
-                resp.raise_for_status()
-                data = resp.json()
-        except Exception as e:
-            logger.error(f"Gamma API fetch failed page {page}: {e}")
-            break
-
-        items = data if isinstance(data, list) else data.get("markets", data.get("data", []))
-        if not items:
-            break
-
-        page_matched = 0
-        for item in items:
-            market_id = item.get("conditionId") or item.get("id", "")
-            if not market_id or market_id in seen_ids:
-                continue
-
-            question = item.get("question", "") or item.get("title", "")
-            classification = _classify_market(question)
-            if not classification:
-                continue
-
-            market_type, city, target_date, bucket_label, (lower, upper) = classification
-            if market_type.value not in enabled_types:
-                continue
-
-            seen_ids.add(market_id)
-
-            # Resolution time
-            res_time = None
-            for key in ("endDate", "end_date", "resolveTime", "resolution_time"):
-                if item.get(key):
-                    try:
-                        ts = item[key]
-                        if isinstance(ts, (int, float)):
-                            res_time = datetime.fromtimestamp(ts, tz=timezone.utc)
-                        else:
-                            res_time = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                    except Exception:
-                        pass
-                    if res_time:
-                        break
-
-            # Each Polymarket weather market is a binary Yes/No market.
-            # clobTokenIds[0] = Yes token, clobTokenIds[1] = No token.
-            clob_ids = item.get("clobTokenIds", [])
-            yes_token_id = clob_ids[0] if clob_ids else ""
-
-            bucket = WeatherBucket(
-                token_id=yes_token_id,
-                outcome_label=bucket_label,
-                lower=lower,
-                upper=upper,
-            )
-
-            vol = float(item.get("volume", item.get("volumeNum", 0)) or 0)
-            markets.append(WeatherMarket(
-                market_id=market_id,
-                question=question,
-                city=city,
-                target_date=target_date,
-                resolution_datetime=res_time,
-                market_type=market_type,
-                buckets=[bucket],
-                total_volume_usdc=vol,
-            ))
-            page_matched += 1
-
-        logger.debug(f"Page {page} (offset {offset}): {len(items)} items, {page_matched} weather matched")
-        if page == 0 and page_matched == 0 and items:
-            sample = [item.get("question", "") or item.get("title", "") for item in items[:3]]
-            logger.debug(f"Sample questions from page 0: {sample}")
-
-        if page_matched == 0:
-            consecutive_empty += 1
-            if page >= MIN_PAGES and consecutive_empty >= STOP_AFTER_EMPTY:
-                logger.info(f"No weather markets in {STOP_AFTER_EMPTY} consecutive pages after {MIN_PAGES} pages — stopping scan")
+        while True:
+            try:
+                events = _events_page(tag_slug, offset)
+            except Exception as e:
+                logger.error(f"Events fetch failed [tag={tag_slug} offset={offset}]: {e}")
                 break
-        else:
-            consecutive_empty = 0
 
-        if len(items) < 100:
-            break
-        offset += 100
-        rate_limited_sleep(0.3)
+            if not events:
+                break
+
+            for event in events:
+                event_count += 1
+                event_end = _parse_res_time(event.get("endDate"))
+
+                for item in event.get("markets", []):
+                    if item.get("closed"):
+                        continue
+
+                    market_id = item.get("conditionId") or item.get("id", "")
+                    if not market_id or market_id in seen_ids:
+                        continue
+
+                    question = item.get("question", "") or item.get("title", "")
+                    classification = _classify_market(question)
+                    if not classification:
+                        continue
+
+                    mtype_parsed, city, target_date, bucket_label, (lower, upper) = classification
+                    if mtype_parsed != mtype:
+                        continue
+
+                    seen_ids.add(market_id)
+
+                    res_time = _parse_res_time(item.get("endDate")) or event_end
+
+                    clob_ids = _parse_clob_ids(item.get("clobTokenIds", []))
+                    yes_token_id = clob_ids[0] if clob_ids else ""
+
+                    bucket = WeatherBucket(
+                        token_id=yes_token_id,
+                        outcome_label=bucket_label,
+                        lower=lower,
+                        upper=upper,
+                    )
+
+                    vol = float(item.get("volume", item.get("volumeNum", 0)) or 0)
+                    markets.append(WeatherMarket(
+                        market_id=market_id,
+                        question=question,
+                        city=city,
+                        target_date=target_date,
+                        resolution_datetime=res_time,
+                        market_type=mtype,
+                        buckets=[bucket],
+                        total_volume_usdc=vol,
+                    ))
+
+            logger.debug(f"[{tag_slug}] offset={offset}: {len(events)} events fetched")
+
+            if len(events) < 100:
+                break
+            offset += 100
+            rate_limited_sleep(0.3)
+
+        logger.info(f"[{tag_slug}] scanned {event_count} events, found {sum(1 for m in markets if m.market_type == mtype)} markets")
 
     by_type: Dict[str, int] = {}
     for m in markets:
