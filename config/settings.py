@@ -54,7 +54,7 @@ class Settings(BaseSettings):
     max_trade_usdc: float = 50.0
     daily_max_usdc: float = 500.0
     min_confidence: float = 0.55
-    max_hours_to_resolution: float = 48.0
+    max_hours_to_resolution: float = 720.0
 
     # ── Market types to scan (comma-separated) ───────────────────────────────
     # Options: temperature, precipitation, snowfall
