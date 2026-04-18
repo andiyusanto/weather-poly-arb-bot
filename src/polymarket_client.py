@@ -335,8 +335,9 @@ def fetch_weather_markets(
     markets: List[WeatherMarket] = []
     seen_ids: set = set()
 
-    MAX_PAGES = 80          # 80 × 100 = 8 000 markets scanned at most
-    STOP_AFTER_EMPTY = 15   # stop if 15 consecutive pages yield zero weather matches
+    MAX_PAGES = 80           # 80 × 100 = 8 000 markets scanned at most
+    MIN_PAGES = 30           # always scan at least 3 000 items before early-exit
+    STOP_AFTER_EMPTY = 15    # stop if 15 consecutive pages yield zero weather matches after MIN_PAGES
 
     offset = 0
     consecutive_empty = 0
@@ -420,11 +421,14 @@ def fetch_weather_markets(
             page_matched += 1
 
         logger.debug(f"Page {page} (offset {offset}): {len(items)} items, {page_matched} weather matched")
+        if page == 0 and page_matched == 0 and items:
+            sample = [item.get("question", "") or item.get("title", "") for item in items[:3]]
+            logger.debug(f"Sample questions from page 0: {sample}")
 
         if page_matched == 0:
             consecutive_empty += 1
-            if consecutive_empty >= STOP_AFTER_EMPTY:
-                logger.info(f"No weather markets in {STOP_AFTER_EMPTY} consecutive pages — stopping scan")
+            if page >= MIN_PAGES and consecutive_empty >= STOP_AFTER_EMPTY:
+                logger.info(f"No weather markets in {STOP_AFTER_EMPTY} consecutive pages after {MIN_PAGES} pages — stopping scan")
                 break
         else:
             consecutive_empty = 0
