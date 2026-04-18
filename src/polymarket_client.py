@@ -376,13 +376,17 @@ def fetch_weather_markets(
     markets: List[WeatherMarket] = []
     seen_ids: set = set()
 
+    MAX_PAGES_PER_TERM = 20  # hard cap: 20 × 100 = 2000 markets per search term
+
     for term, hint in _SEARCH_TERMS.items():
         # Skip terms for disabled market types
         if hint not in enabled_types:
             continue
 
         offset = 0
-        while True:
+        page = 0
+        term_matched = 0
+        while page < MAX_PAGES_PER_TERM:
             url = f"{settings.gamma_api_host}/markets"
             params = {
                 "limit": min(limit, 100),
@@ -397,10 +401,11 @@ def fetch_weather_markets(
                     resp.raise_for_status()
                     data = resp.json()
             except Exception as e:
-                logger.error(f"Gamma API fetch failed [{term}]: {e}")
+                logger.error(f"Gamma API fetch failed [{term}] page {page}: {e}")
                 break
 
             items = data if isinstance(data, list) else data.get("markets", data.get("data", []))
+            logger.debug(f"[{term}] page {page}: {len(items)} items from API")
             if not items:
                 break
 
@@ -461,11 +466,15 @@ def fetch_weather_markets(
                     buckets=buckets,
                     total_volume_usdc=vol,
                 ))
+                term_matched += 1
 
             if len(items) < params["limit"]:
                 break
+            page += 1
             offset += params["limit"]
             rate_limited_sleep(0.5)
+
+        logger.info(f"[{term}] scanned {page + 1} page(s), matched {term_matched} markets")
 
     by_type = {}
     for m in markets:
