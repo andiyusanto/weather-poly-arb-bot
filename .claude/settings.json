@@ -5,7 +5,9 @@
       "Bash(sqlite3 data/trades.db \".schema\")",
       "Bash(sqlite3 data/trades.db \"SELECT COUNT\\(*\\) as total_trades FROM trades;\")",
       "Bash(zcat logs/bot_20260418.2026-04-18_02-05-23_882553.log.gz)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(python -m py_compile src/main.py src/trader.py src/utils.py src/polymarket_client.py)",
+      "Bash(python3 -m py_compile src/main.py src/trader.py src/utils.py src/polymarket_client.py)"
     ]
   }
 }

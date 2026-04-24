@@ -172,36 +172,53 @@ class TradeStore:
                     size_usdc REAL,
                     side TEXT,
                     dry_run INTEGER,
+                    shadow INTEGER DEFAULT 0,
                     outcome TEXT,
                     pnl REAL,
-                    timestamp TEXT
+                    timestamp TEXT,
+                    resolved_at TEXT
                 )
                 """
             )
+            self._migrate(conn)
             conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Add columns introduced after initial schema without dropping data."""
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+        for col, defn in [
+            ("shadow",      "INTEGER DEFAULT 0"),
+            ("resolved_at", "TEXT"),
+        ]:
+            if col not in existing:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
 
     def record(self, trade: dict) -> None:
         trade.setdefault("timestamp", now_utc().isoformat())
         trade.setdefault("outcome", None)
         trade.setdefault("pnl", None)
+        trade.setdefault("shadow", 0)
+        trade.setdefault("resolved_at", None)
         with sqlite3.connect(self._db) as conn:
             conn.execute(
                 """
                 INSERT INTO trades
                     (market_id, token_id, city, bucket_label, model_prob, market_price, ev,
-                     confidence, size_usdc, side, dry_run, outcome, pnl, timestamp)
+                     confidence, size_usdc, side, dry_run, shadow, outcome, pnl, timestamp, resolved_at)
                 VALUES (:market_id,:token_id,:city,:bucket_label,:model_prob,:market_price,:ev,
-                        :confidence,:size_usdc,:side,:dry_run,:outcome,:pnl,:timestamp)
+                        :confidence,:size_usdc,:side,:dry_run,:shadow,:outcome,:pnl,:timestamp,:resolved_at)
                 """,
                 trade,
             )
             conn.commit()
 
     def today_spent(self) -> float:
+        """Total USDC deployed today (live trades only, excludes shadow/dry-run)."""
         today = now_utc().date().isoformat()
         with sqlite3.connect(self._db) as conn:
             row = conn.execute(
-                "SELECT COALESCE(SUM(size_usdc),0) FROM trades WHERE DATE(timestamp)=?", (today,)
+                "SELECT COALESCE(SUM(size_usdc),0) FROM trades WHERE DATE(timestamp)=? AND dry_run=0 AND shadow=0",
+                (today,),
             ).fetchone()
         return float(row[0])
 
@@ -216,9 +233,48 @@ class TradeStore:
     def update_outcome(self, trade_id: int, outcome: str, pnl: float) -> None:
         with sqlite3.connect(self._db) as conn:
             conn.execute(
-                "UPDATE trades SET outcome=?, pnl=? WHERE id=?", (outcome, pnl, trade_id)
+                "UPDATE trades SET outcome=?, pnl=?, resolved_at=? WHERE id=?",
+                (outcome, pnl, now_utc().isoformat(), trade_id),
             )
             conn.commit()
+
+    def open_shadow_trades(self) -> list[dict]:
+        """Shadow trades that have not yet been resolved."""
+        with sqlite3.connect(self._db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE shadow=1 AND outcome IS NULL ORDER BY id"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def shadow_stats(self) -> dict:
+        """Aggregate performance stats for all resolved shadow trades."""
+        with sqlite3.connect(self._db) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE shadow=1 ORDER BY id"
+            ).fetchall()
+        trades = [dict(r) for r in rows]
+
+        total = len(trades)
+        resolved = [t for t in trades if t.get("outcome") is not None]
+        open_count = total - len(resolved)
+        wins = [t for t in resolved if t.get("outcome", "").lower() == "yes"]
+        total_pnl = sum(t.get("pnl") or 0.0 for t in resolved)
+        avg_ev = sum(t.get("ev") or 0.0 for t in trades) / max(total, 1)
+        avg_conf = sum(t.get("confidence") or 0.0 for t in trades) / max(total, 1)
+
+        return dict(
+            total=total,
+            resolved=len(resolved),
+            open=open_count,
+            wins=len(wins),
+            win_rate=len(wins) / max(len(resolved), 1),
+            total_pnl=total_pnl,
+            avg_ev=avg_ev,
+            avg_conf=avg_conf,
+            trades=trades,
+        )
 
 
 # ── Misc formatting ───────────────────────────────────────────────────────────

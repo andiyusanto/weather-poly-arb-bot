@@ -642,6 +642,40 @@ def enrich_with_prices(markets: List[WeatherMarket]) -> List[WeatherMarket]:
     return markets
 
 
+# ── Market resolution ────────────────────────────────────────────────────────
+
+def fetch_market_resolution(condition_id: str) -> Optional[str]:
+    """
+    Query Gamma API for the resolution outcome of a single market.
+
+    Args:
+        condition_id: The market's conditionId (hex string stored in trades.market_id).
+
+    Returns:
+        'yes' or 'no' when the market has resolved, None if still open or unknown.
+    """
+    if not condition_id:
+        return None
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(f"{settings.gamma_api_host}/markets/{condition_id}")
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            if not isinstance(data, dict):
+                return None
+            # Market must be closed/resolved — skip still-open markets
+            if not (data.get("closed") or data.get("resolved")):
+                return None
+            outcome = (data.get("outcome") or "").strip().lower()
+            return outcome if outcome in ("yes", "no") else None
+    except Exception as e:
+        logger.debug(f"Resolution fetch failed [{condition_id}]: {e}")
+        return None
+
+
 # ── Order placement ───────────────────────────────────────────────────────────
 
 def place_market_order(

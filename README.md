@@ -150,10 +150,10 @@ sudo apt install -y tmux
 # Create a named session for the bot
 tmux new -s polybot
 
-# Inside the session: activate venv and start
+# Inside the session: activate venv and start in shadow mode
 cd /opt/weather-poly-arb-bot
 source .venv/bin/activate
-python run.py trade --dry-run
+python run.py trade --shadow    # records decisions, no real orders
 ```
 
 Detach with `Ctrl+B D`. The bot keeps running after you close SSH.
@@ -400,11 +400,40 @@ ENABLED_MARKET_TYPES=temperature,precipitation,snowfall,wind_speed python run.py
 
 ### Auto-trade mode
 
+| Command | Orders placed? | Tracked in DB? | Outcome resolved? |
+|---|---|---|---|
+| `--dry-run` | No | No | No |
+| `--shadow` | No | **Yes** | **Yes** |
+| `--live` | **Yes** | Yes | Manual |
+
 ```bash
-python run.py trade --dry-run          # simulate
-python run.py trade --live             # real orders
-python run.py trade --dry-run --once   # single cycle
+python run.py trade --dry-run          # log only, nothing recorded
+python run.py trade --shadow           # record to DB, no real orders (recommended first step)
+python run.py trade --live             # real orders via CLOB
+
+python run.py trade --shadow --once    # single shadow cycle and exit
+python run.py trade --dry-run --once   # single dry-run cycle and exit
 ```
+
+### Shadow mode — edge validation workflow
+
+Shadow mode sits between dry-run and live. It submits no orders but records every decision to `trades.db`, then resolves each position once the market closes. Use it to confirm your model has real edge on live Polymarket prices before risking capital.
+
+```bash
+# Step 1 — run shadow for ≥1 week on schedule (every 30 min)
+python run.py trade --shadow
+
+# Step 2 — check for newly resolved markets and compute P&L (run daily)
+python run.py resolve-shadow
+
+# Step 3 — view win rate, total P&L, per-city breakdown
+python run.py shadow-pnl
+```
+
+**Go live only when** `shadow-pnl` shows:
+- Win rate ≥ 55% on ≥ 30 resolved trades
+- Total P&L positive
+- No single city driving all the edge (diversification check)
 
 ### Backtest with per-type breakdown
 
@@ -416,7 +445,7 @@ python run.py backtest --n-sims 1000 --no-grid   # skip grid search
 ### View trade history
 
 ```bash
-python run.py show-trades --n 50
+python run.py show-trades --n 50   # shows mode: SHADOW / DRY / LIVE with colored P&L
 ```
 
 ---
@@ -652,7 +681,8 @@ The `all_bucket_probabilities()` method is implemented on all four forecast type
 
 ## Risk Management
 
-- **Start with dry-run** for at least 1–2 weeks before going live
+- **Validation ladder** — dry-run → shadow (≥1 week, ≥30 resolved trades) → live. Never skip shadow.
+- **Shadow exit criteria** — win rate ≥ 55%, positive total P&L, no single city > 50% of trades before going live.
 - **Quarter Kelly (0.25)** is recommended — reduces variance vs full Kelly
 - **Precip/snow liquidity** — these markets often have lower volume; respect `max_usdc` limits
 - **Nominatim rate limit** — 1 req/sec enforced; don't run multiple instances simultaneously

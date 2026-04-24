@@ -71,23 +71,32 @@ def trade(
     top_n: int = typer.Option(10, "--top-n", help="Max trades per cycle"),
     bankroll: float = typer.Option(1000.0, "--bankroll", help="Bankroll for Kelly sizing (USDC)"),
     dry_run: bool = typer.Option(settings.dry_run, "--dry-run/--live", help="Dry run or live trading"),
+    shadow: bool = typer.Option(False, "--shadow", help="Shadow mode: record trades for outcome tracking, no real orders"),
     once: bool = typer.Option(False, "--once", help="Run one cycle then exit (default: run on schedule)"),
     interval: int = typer.Option(settings.scan_interval_minutes, "--interval", help="Scan interval (minutes)"),
 ) -> None:
     """
     Auto-execute trades for high-EV opportunities.
 
-    ⚠️  WARNING: This command places REAL ORDERS if --live is passed.
-    Make sure you have tested with --dry-run first.
+    Modes (in order of risk):
+      --dry-run   Log only, no DB record.  Safe for initial testing.
+      --shadow    Record to DB, no real orders.  Use this to validate edge before going live.
+      --live      Real orders via CLOB.  Requires POLY_* credentials in .env.
+
+    ⚠️  WARNING: --live places REAL ORDERS. Run --shadow for ≥1 week first.
     """
     setup_logging()
     _banner()
 
-    if not dry_run and not settings.has_clob_creds:
-        console.print("[bold red]ERROR: POLY_PRIVATE_KEY / POLY_API_KEY not set. Run setup.py first.[/bold red]")
-        raise typer.Exit(1)
+    if shadow and not dry_run:
+        # --shadow implies no live order, but we still need CLOB prices
+        console.print("[bold yellow]  🟡 SHADOW MODE — recording trades for outcome validation[/bold yellow]\n")
+        dry_run = True  # prevent any accidental live order path
 
-    if not dry_run:
+    if not dry_run and not shadow:
+        if not settings.has_clob_creds:
+            console.print("[bold red]ERROR: POLY_PRIVATE_KEY / POLY_API_KEY not set. Run setup.py first.[/bold red]")
+            raise typer.Exit(1)
         console.print("[bold red]⚠️  LIVE TRADING MODE[/bold red]")
         confirm = typer.confirm("Are you sure you want to place real orders?")
         if not confirm:
@@ -102,6 +111,7 @@ def trade(
                 min_confidence=min_conf,
                 max_hours=max_hours,
                 dry_run=dry_run,
+                shadow=shadow,
                 top_n=top_n,
                 bankroll=bankroll,
             )
@@ -196,25 +206,91 @@ def show_trades(
         return
 
     table = Table(header_style="bold magenta", border_style="dim")
-    for col in ["id", "city", "bucket_label", "model_prob", "market_price", "ev", "size_usdc", "dry_run", "outcome", "pnl", "timestamp"]:
+    for col in ["id", "mode", "city", "bucket_label", "model_prob", "market_price", "ev", "size_usdc", "outcome", "pnl", "timestamp"]:
         table.add_column(col, no_wrap=True)
 
     for t in trades:
+        if t.get("shadow"):
+            mode_str = "[yellow]SHADOW[/yellow]"
+        elif t.get("dry_run"):
+            mode_str = "[blue]DRY[/blue]"
+        else:
+            mode_str = "[green]LIVE[/green]"
+
+        outcome = t.get("outcome")
+        outcome_str = (
+            "[green]YES[/green]" if outcome == "yes"
+            else "[red]NO[/red]" if outcome == "no"
+            else "[dim]open[/dim]"
+        )
+        pnl = t.get("pnl")
+        pnl_str = (
+            f"[green]${pnl:.2f}[/green]" if pnl and pnl >= 0
+            else f"[red]${pnl:.2f}[/red]" if pnl is not None
+            else "-"
+        )
         table.add_row(
             str(t.get("id", "")),
+            mode_str,
             str(t.get("city", "")),
             str(t.get("bucket_label", "")),
             f"{t.get('model_prob', 0):.1%}",
             f"{t.get('market_price', 0):.1%}",
             f"{t.get('ev', 0):.1%}",
             f"${t.get('size_usdc', 0):.2f}",
-            "YES" if t.get("dry_run") else "LIVE",
-            str(t.get("outcome") or "open"),
-            f"${t.get('pnl', 0) or 0:.2f}" if t.get("pnl") is not None else "-",
+            outcome_str,
+            pnl_str,
             str(t.get("timestamp", ""))[:19],
         )
 
     console.print(table)
+
+
+@app.command()
+def resolve_shadow(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show status for each unresolved trade"),
+) -> None:
+    """
+    Check Gamma API for resolution of open shadow trades and update P&L.
+
+    Run this periodically (e.g. daily) to close out shadow positions as
+    markets resolve. Each resolved trade gets an outcome (yes/no) and a
+    computed P&L based on the ask price at entry.
+    """
+    setup_logging()
+    _banner()
+    from src.trader import resolve_shadow_trades
+
+    resolved = resolve_shadow_trades(verbose=verbose)
+
+    if not resolved:
+        console.print("[yellow]No new resolutions found.[/yellow]")
+        return
+
+    console.print(f"\n[green]Resolved {len(resolved)} shadow trade(s):[/green]")
+    for t in resolved:
+        outcome = t.get("outcome", "?")
+        pnl = t.get("pnl", 0.0)
+        sign = "✅" if outcome == "yes" else "❌"
+        color = "green" if pnl >= 0 else "red"
+        console.print(
+            f"  {sign} #{t['id']} {t.get('city')} {t.get('bucket_label')} "
+            f"→ {outcome.upper()} | [{color}]P&L ${pnl:.2f}[/{color}]"
+        )
+
+
+@app.command()
+def shadow_pnl() -> None:
+    """
+    Display shadow mode performance: win rate, total P&L, per-city breakdown.
+
+    This is your edge validation dashboard. Run it after resolve-shadow
+    to see whether the model's EV predictions are materialising in practice.
+    """
+    setup_logging()
+    _banner()
+    from src.trader import shadow_performance_report
+    shadow_performance_report()
 
 
 if __name__ == "__main__":
