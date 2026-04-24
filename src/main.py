@@ -83,8 +83,8 @@ def trade(
     setup_logging()
     _banner()
 
-    if not dry_run and not settings.has_polymarket_key:
-        console.print("[bold red]ERROR: POLYMARKET_PRIVATE_KEY not set. Cannot trade live.[/bold red]")
+    if not dry_run and not settings.has_clob_creds:
+        console.print("[bold red]ERROR: POLY_PRIVATE_KEY / POLY_API_KEY not set. Run setup.py first.[/bold red]")
         raise typer.Exit(1)
 
     if not dry_run:

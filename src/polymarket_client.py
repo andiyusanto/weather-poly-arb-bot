@@ -541,16 +541,19 @@ def _get_clob_client():
             return None
 
         creds = None
-        if settings.polymarket_api_key:
+        if settings.poly_api_key:
             creds = ApiCreds(
-                api_key=settings.polymarket_api_key,
-                api_secret=settings.polymarket_api_secret,
-                api_passphrase=settings.polymarket_api_passphrase,
+                api_key=settings.poly_api_key,
+                api_secret=settings.poly_api_secret,
+                api_passphrase=settings.poly_api_passphrase,
             )
+
         return ClobClient(
             host=settings.clob_host,
-            key=settings.polymarket_private_key,
+            key=settings.poly_private_key,
             chain_id=137,
+            funder=settings.poly_funder_address or None,
+            signature_type=settings.poly_sig_type,
             creds=creds,
         )
     except Exception as e:

@@ -36,10 +36,13 @@ class Settings(BaseSettings):
     )
 
     # ── Polymarket ──────────────────────────────────────────────────────────
-    polymarket_private_key: str = ""
-    polymarket_api_key: str = ""
-    polymarket_api_secret: str = ""
-    polymarket_api_passphrase: str = ""
+    # Written by setup.py — do not edit manually
+    poly_private_key: str = ""
+    poly_funder_address: str = ""
+    poly_api_key: str = ""
+    poly_api_secret: str = ""
+    poly_api_passphrase: str = ""
+    poly_sig_type: int = 0
     clob_host: str = "https://clob.polymarket.com"
     gamma_api_host: str = "https://gamma-api.polymarket.com"
 
@@ -105,7 +108,11 @@ class Settings(BaseSettings):
 
     @property
     def has_polymarket_key(self) -> bool:
-        return bool(self.polymarket_private_key)
+        return bool(self.poly_private_key)
+
+    @property
+    def has_clob_creds(self) -> bool:
+        return bool(self.poly_private_key and self.poly_api_key)
 
 
 # Singleton — import this everywhere

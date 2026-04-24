@@ -1,12 +1,13 @@
 # Polymarket Weather Arbitrage Bot
 
-A production-ready Python bot that exploits systematic edge in Polymarket's daily weather bucket markets across **three categories**:
+A production-ready Python bot that exploits systematic edge in Polymarket's daily weather bucket markets across **four categories**:
 
 | Category | Markets | Example | Open-Meteo variable |
 |---|---|---|---|
 | 🌡️ Temperature | "Highest temperature in Miami on Apr 18" | 85–90°F bucket | `temperature_2m_max` |
 | 🌧️ Precipitation | "Total precipitation in Hong Kong on Apr 18" | ≥ 10 mm bucket | `precipitation_sum` |
 | ❄️ Snowfall | "Snowfall in Chicago on Apr 18" | 5–10 cm bucket | `snowfall_sum` |
+| 💨 Wind Speed | "Max wind speed in Tokyo on Apr 18" | 15–20 mph bucket | `wind_speed_10m_max` |
 
 The bot fetches multi-model ensemble forecasts, computes calibrated bucket probabilities, and surfaces (or auto-executes) only the highest expected-value bets with fractional Kelly sizing.
 
@@ -14,7 +15,7 @@ The bot fetches multi-model ensemble forecasts, computes calibrated bucket proba
 
 ## The Edge
 
-Polymarket weather markets are priced by retail traders, not meteorologists. This creates persistent mispricings in all three categories:
+Polymarket weather markets are priced by retail traders, not meteorologists. This creates persistent mispricings in all four categories:
 
 ### Why precipitation and snowfall are the best edge right now
 - **Fewer bots scanning** — almost no quantitative bots are trading precip/snow markets yet
@@ -29,7 +30,8 @@ Polymarket weather markets are priced by retail traders, not meteorologists. Thi
 | 🌡️ Temperature | 62–65% | 18–24% | 1.8–2.4 | 3–5 |
 | 🌧️ Precipitation | 66–72% | 24–32% | 2.2–3.0 | 2–4 |
 | ❄️ Snowfall | 70–78% | 28–38% | 2.5–3.4 | 1–3 |
-| **Combined** | **65–70%** | **22–30%** | **2.1–2.9** | **6–12** |
+| 💨 Wind Speed | 63–68% | 20–28% | 2.0–2.6 | 2–4 |
+| **Combined** | **65–70%** | **22–30%** | **2.1–2.9** | **8–16** |
 
 *Higher win rate on precip/snow because ensemble agreement is more decisive than temperature spread.*
 *Actual results depend on model calibration, liquidity, and real edge.*
@@ -47,14 +49,18 @@ weather-poly-arb-bot/
 │   ├── __init__.py
 │   ├── main.py              # Typer CLI: scan / trade / backtest / show-trades
 │   ├── scanner.py           # Orchestrator — routes to correct forecast by market type
-│   ├── forecast.py          # KDE (temp) + empirical (precip/snow) probability engine
+│   ├── forecast.py          # KDE (temp/wind) + empirical (precip/snow) probability engine
 │   ├── polymarket_client.py # MarketType enum, WeatherBucket, Gamma + CLOB client
 │   ├── strategy.py          # Duck-typed EV calc + Kelly sizing for all market types
 │   ├── backtester.py        # Monte Carlo + grid-search, per-type breakdown
 │   ├── trader.py            # Execution + Telegram alerts + trade recording
 │   └── utils.py             # Logging, geocache, trade DB, helpers
+├── tests/
+│   └── test_wind_forecast.py  # Unit tests for wind speed forecast logic
 ├── data/                    # SQLite databases (auto-created)
 ├── logs/                    # Rotating log files
+├── setup.py                 # One-time credential generator (pre_setup.env → .env)
+├── approve_usdc.py          # On-chain USDC approval for Polymarket spenders
 ├── .env.example
 ├── requirements.txt
 ├── run.py                   # Entry point
@@ -207,18 +213,46 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment
+### 2. Generate credentials (one-time)
 
-```bash
-cp .env.example .env
+Create `pre_setup.env` with your wallet details:
+
+```env
+POLY_PRIVATE_KEY=0x...
+POLY_FUNDER_ADDRESS=0x...
 ```
 
-Key settings:
+Then run the setup script to derive Level 2 API credentials and write them to `.env`:
+
+```bash
+python setup.py
+```
+
+This calls `ClobClient.create_or_derive_api_creds()` and writes `POLY_PRIVATE_KEY`, `POLY_API_KEY`, `POLY_API_SECRET`, `POLY_API_PASSPHRASE`, and `POLY_SIG_TYPE` to `.env`.
+
+### 3. Approve USDC on-chain (one-time)
+
+`setup.py` calls `update_balance_allowance()` which is informational only — it does not submit an on-chain transaction. Run this to do the real ERC-20 approval for both Polymarket spender contracts:
+
+```bash
+python approve_usdc.py
+```
+
+This submits `approve(MAX_UINT256)` to both CTF Exchange (`0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`) and NegRisk CTF Exchange (`0xC5d563A36AE78145C45a50134d48A1215220f80a`) on Polygon mainnet. Falls back across five public RPCs automatically.
+
+### 4. Configure `.env`
+
+Key settings written by `setup.py` + manual options:
 
 | Variable | Description | Default |
 |---|---|---|
-| `ENABLED_MARKET_TYPES` | Comma-separated: `temperature,precipitation,snowfall` | all three |
-| `POLYMARKET_PRIVATE_KEY` | Polygon wallet private key | required for live |
+| `POLY_PRIVATE_KEY` | Polygon wallet private key (written by `setup.py`) | required for live |
+| `POLY_FUNDER_ADDRESS` | Funder wallet address (written by `setup.py`) | optional |
+| `POLY_API_KEY` | CLOB Level 2 API key (written by `setup.py`) | required for live |
+| `POLY_API_SECRET` | CLOB API secret (written by `setup.py`) | required for live |
+| `POLY_API_PASSPHRASE` | CLOB API passphrase (written by `setup.py`) | required for live |
+| `POLY_SIG_TYPE` | Signature type: `0` = EOA, `2` = Gnosis Safe (written by `setup.py`) | `0` |
+| `ENABLED_MARKET_TYPES` | Comma-separated: `temperature,precipitation,snowfall,wind_speed` | first three |
 | `TELEGRAM_BOT_TOKEN` | From @BotFather | optional |
 | `TELEGRAM_CHAT_ID` | Your chat/group ID | optional |
 | `DRY_RUN` | `true` = no real orders | `true` |
@@ -227,7 +261,7 @@ Key settings:
 | `MAX_TRADE_USDC` | Max per trade | `50.0` |
 | `DAILY_MAX_USDC` | Daily cap | `500.0` |
 | `MIN_CONFIDENCE` | Min ensemble confidence | `0.55` |
-| `MAX_HOURS_TO_RESOLUTION` | Only trade within N hours | `48` |
+| `MAX_HOURS_TO_RESOLUTION` | Only trade within N hours | `720` |
 | `ENSEMBLE_MODELS` | Open-Meteo model list | `icon_seamless,gfs_seamless,ecmwf_ifs025` |
 
 ---
@@ -235,11 +269,11 @@ Key settings:
 ## How Automatic City Discovery Works
 
 Every scan:
-1. **Gamma API** — searches `"highest temperature"`, `"precipitation in"`, `"total precipitation"`, `"rain in"`, `"snowfall in"`, `"total snowfall"`, `"inches of snow"`, and more
+1. **Gamma API** — searches `"highest temperature"`, `"precipitation in"`, `"total precipitation"`, `"rain in"`, `"snowfall in"`, `"total snowfall"`, `"inches of snow"`, `"wind speed"`, and more
 2. **Market classifier** — regex extracts market type, city, and date from each title
-3. **Bucket parser** — per-type parsers handle °F (temp), mm (precip, with inch conversion), cm (snow, with inch conversion)
+3. **Bucket parser** — per-type parsers handle °F (temp), mm (precip, with inch conversion), cm (snow, with inch conversion), mph/km/h (wind)
 4. **Geocoding** — Nominatim + Open-Meteo timezone lookup, cached permanently in SQLite
-5. **Forecast dispatch** — routes to `get_ensemble_forecast` / `get_precip_forecast` / `get_snow_forecast`
+5. **Forecast dispatch** — routes to `get_ensemble_forecast` / `get_precip_forecast` / `get_snow_forecast` / `get_wind_forecast`
 
 ---
 
@@ -263,7 +297,15 @@ Every scan:
 - Unit handling: inch labels auto-converted (1 inch = 2.54 cm)
 - Confidence: same zero-inflation logic as precipitation
 
-All three use:
+### 💨 Wind Speed
+- Variables: `wind_speed_10m_max` per model (daily max at 10 m height)
+- Method: **Gaussian KDE** — wind is continuous and not zero-inflated, same approach as temperature
+- Unit conversion: Open-Meteo returns km/h; all probabilities computed in mph (`KPH_TO_MPH = 0.621371`)
+- Bucket parsing: handles `"10–15 mph"`, `"less than 10 mph"`, `"25 mph or higher"`, `"30–50 km/h"`, etc.
+- Confidence: `_wind_confidence(std_mph, n_models)` — maps spread [5, 25 mph] → confidence [0.9, 0.1] with a small model-count bonus
+- KDE integration: uses `scipy gaussian_kde.integrate_box_1d(lo, hi)` (avoids `np.trapz` which was removed in NumPy 2.0); falls back to empirical counting when ensemble spread is near zero
+
+All four use:
 - Multi-model weighting (ECMWF=1.1, ICON=1.0, GFS=0.9, GEM=0.8)
 - Historical bias correction (per city/model/variable, 30-day rolling mean)
 - Same EV formula, fractional Kelly sizing, and daily risk limits
@@ -272,7 +314,7 @@ All three use:
 
 ## Usage
 
-### Scan all three types (default)
+### Scan all four types (default)
 
 ```bash
 python run.py scan
@@ -286,6 +328,9 @@ ENABLED_MARKET_TYPES=precipitation,snowfall python run.py scan
 
 # Only temperature
 ENABLED_MARKET_TYPES=temperature python run.py scan --min-ev 0.15
+
+# Include wind speed
+ENABLED_MARKET_TYPES=temperature,precipitation,snowfall,wind_speed python run.py scan
 ```
 
 ### Auto-trade mode
@@ -432,6 +477,14 @@ MIN_CONFIDENCE=0.60
 MAX_HOURS_TO_RESOLUTION=36
 ```
 
+### Wind speed (new market type)
+```
+ENABLED_MARKET_TYPES=wind_speed
+MIN_EV_THRESHOLD=0.20
+MIN_CONFIDENCE=0.55
+MAX_HOURS_TO_RESOLUTION=48
+```
+
 ---
 
 ## Bias Correction
@@ -439,17 +492,23 @@ MAX_HOURS_TO_RESOLUTION=36
 Record actual outcomes to improve future calibration:
 
 ```python
-from src.forecast import record_observed_temp, record_observed_precip, record_observed_snow
+from src.forecast import (
+    record_observed_temp, record_observed_precip,
+    record_observed_snow, record_observed_wind,
+)
 from datetime import date
 
 # Temperature
 record_observed_temp("Miami", "gfs_seamless", date(2026, 4, 17), 88.2, 91.0)
 
-# Precipitation  
+# Precipitation
 record_observed_precip("Hong Kong", "ecmwf_ifs025", date(2026, 4, 17), 8.4, 12.1)
 
 # Snowfall
 record_observed_snow("Chicago", "icon_seamless", date(2026, 4, 17), 2.1, 0.0)
+
+# Wind speed (forecast and observed both in mph)
+record_observed_wind("Tokyo", "icon_seamless", date(2026, 4, 17), 18.5, 21.3)
 ```
 
 ---
@@ -501,17 +560,17 @@ MAX_CONCURRENCY=25   # recommended max — stays within Open-Meteo free tier
 ```
 Market type detected by _classify_market()
            │
-    ┌──────┼──────────┐
-    │      │          │
-   temp  precip     snow
-    │      │          │
-temperature_2m_max   precipitation_sum   snowfall_sum
-(per model ensemble) (per model ensemble)(per model ensemble)
-    │      │          │
-  KDE   empirical  empirical
-  (°F)  counts(mm) counts(cm)
-    │      │          │
-    └──────┴──────────┘
+    ┌──────┼──────────┬──────────┐
+    │      │          │          │
+   temp  precip     snow       wind
+    │      │          │          │
+temperature_2m_max  precipitation_sum  snowfall_sum  wind_speed_10m_max
+(per model ensemble)(per model ensemble)(per model)(per model ensemble)
+    │      │          │          │
+  KDE   empirical  empirical   KDE
+  (°F)  counts(mm) counts(cm) (mph, kph→mph)
+    │      │          │          │
+    └──────┴──────────┴──────────┘
            │
   all_bucket_probabilities()  ← uniform interface
            │
@@ -522,7 +581,7 @@ temperature_2m_max   precipitation_sum   snowfall_sum
    Kelly sizing → position
 ```
 
-The `all_bucket_probabilities()` method is implemented on all three forecast types, making `strategy.py` completely type-agnostic — adding a 4th market type (e.g., wind speed) requires only a new forecast class + bucket parser.
+The `all_bucket_probabilities()` method is implemented on all four forecast types, making `strategy.py` completely type-agnostic — adding a 5th market type requires only a new forecast class + bucket parser.
 
 ---
 
