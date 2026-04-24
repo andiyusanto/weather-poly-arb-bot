@@ -23,9 +23,11 @@ from config.settings import CITIES_CACHE_DB, CITIES_YAML, settings
 from src.forecast import (
     AnyForecast,
     EnsembleForecast,
+    WindForecast,
     get_ensemble_forecast,
     get_precip_forecast,
     get_snow_forecast,
+    get_wind_forecast,
 )
 from src.polymarket_client import (
     MarketType,
@@ -118,6 +120,8 @@ def _fetch_forecast(
         return get_precip_forecast(city=city, lat=lat, lon=lon, target_date=target_date)
     if market_type == MarketType.SNOWFALL:
         return get_snow_forecast(city=city, lat=lat, lon=lon, target_date=target_date)
+    if market_type == MarketType.WIND_SPEED:
+        return get_wind_forecast(city=city, lat=lat, lon=lon, target_date=target_date)
     return None
 
 

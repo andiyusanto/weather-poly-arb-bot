@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sqlite3 data/trades.db \".tables\")",
+      "Bash(sqlite3 data/trades.db \".schema\")",
+      "Bash(sqlite3 data/trades.db \"SELECT COUNT\\(*\\) as total_trades FROM trades;\")",
+      "Bash(zcat logs/bot_20260418.2026-04-18_02-05-23_882553.log.gz)",
+      "Bash(python3 -)"
+    ]
+  }
+}

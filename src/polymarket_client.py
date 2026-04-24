@@ -27,14 +27,25 @@ class MarketType(str, Enum):
     TEMPERATURE   = "temperature"
     PRECIPITATION = "precipitation"
     SNOWFALL      = "snowfall"
+    WIND_SPEED    = "wind_speed"
 
     @property
     def emoji(self) -> str:
-        return {"temperature": "🌡️", "precipitation": "🌧️", "snowfall": "❄️"}[self.value]
+        return {
+            "temperature": "🌡️",
+            "precipitation": "🌧️",
+            "snowfall": "❄️",
+            "wind_speed": "💨",
+        }[self.value]
 
     @property
     def unit_label(self) -> str:
-        return {"temperature": "°F", "precipitation": "mm", "snowfall": "cm"}[self.value]
+        return {
+            "temperature": "°F",
+            "precipitation": "mm",
+            "snowfall": "cm",
+            "wind_speed": "mph",
+        }[self.value]
 
 
 # ── Unified bucket dataclass ──────────────────────────────────────────────────
@@ -110,10 +121,18 @@ _SNOW_TITLE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Wind speed: "Will the (maximum) wind speed in {CITY} be {BUCKET} (mph|km/h) on {DATE}?"
+_WIND_TITLE_RE = re.compile(
+    r"Will the (?:maximum |max |average |avg )?wind (?:speed|gust|gusts?) in "
+    r"(?P<city>[A-Za-z][A-Za-z\s]+?) be (?P<bucket>[^?]+?) on (?P<date>[A-Za-z]+ \d+)\?",
+    re.IGNORECASE,
+)
+
 # Shared helpers
-_RANGE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)")
-_INCH_MM  = 25.4
-_INCH_CM  = 2.54
+_RANGE_RE  = re.compile(r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)")
+_INCH_MM   = 25.4
+_INCH_CM   = 2.54
+_KPH_TO_MPH = 0.621371
 
 
 # ── Date parser ───────────────────────────────────────────────────────────────
@@ -168,6 +187,13 @@ def _to_mm(value: float, label: str) -> float:
 def _to_cm(value: float, label: str) -> float:
     if re.search(r"\bin(?:ch(?:es)?)?\b", label, re.IGNORECASE):
         return value * _INCH_CM
+    return value
+
+
+def _to_mph(value: float, label: str) -> float:
+    """Convert wind value to mph; treats bare numbers and 'mph' as-is, converts 'km/h' or 'kph'."""
+    if re.search(r"\bk(?:m(?:/h|ph)?|ph)\b", label, re.IGNORECASE):
+        return value * _KPH_TO_MPH
     return value
 
 
@@ -246,6 +272,40 @@ def _parse_precip_bucket_from_question(bucket_str: str) -> Optional[Tuple[float,
     return None
 
 
+def _parse_wind_bucket_from_question(bucket_str: str) -> Optional[Tuple[float, float]]:
+    """
+    Parse wind speed range from the bucket portion of a title.
+    Returns (lower_mph, upper_mph). Converts km/h if unit label present.
+    """
+    clean = bucket_str.strip()
+
+    if re.search(r"\b(?:less than|below|under)\b", clean, re.IGNORECASE):
+        m = re.search(r"(\d+(?:\.\d+)?)", clean)
+        if m:
+            return 0.0, _to_mph(float(m.group(1)), clean)
+
+    if re.search(r"\b(?:more than|or more|over|above|or higher)\b", clean, re.IGNORECASE):
+        m = re.search(r"(\d+(?:\.\d+)?)", clean)
+        if m:
+            return _to_mph(float(m.group(1)), clean), 9999.0
+
+    m = re.search(r"between\s+(\d+(?:\.\d+)?)\s+and\s+(\d+(?:\.\d+)?)", clean, re.IGNORECASE)
+    if m:
+        return _to_mph(float(m.group(1)), clean), _to_mph(float(m.group(2)), clean)
+
+    m = _RANGE_RE.search(clean)
+    if m:
+        return _to_mph(float(m.group(1)), clean), _to_mph(float(m.group(2)), clean)
+
+    # Exact single value (e.g. "15 mph") — treat as [v, v+5) 5-mph bin
+    m2 = re.search(r"(\d+(?:\.\d+)?)", clean)
+    if m2:
+        v = _to_mph(float(m2.group(1)), clean)
+        return v, v + 5.0
+
+    return None
+
+
 def _parse_snow_bucket_from_question(bucket_str: str) -> Optional[Tuple[float, float]]:
     """
     Parse snowfall range from the bucket portion of a title.
@@ -310,16 +370,27 @@ def _classify_market(
         if d and bucket:
             return MarketType.SNOWFALL, m.group("city").strip().title(), d, bucket_str, bucket
 
+    # Wind speed: "Will the (max) wind speed in {CITY} be {BUCKET} on {DATE}?"
+    m = _WIND_TITLE_RE.match(question)
+    if m:
+        d = _parse_date(m.group("date"))
+        bucket_str = m.group("bucket").strip()
+        bucket = _parse_wind_bucket_from_question(bucket_str)
+        if d and bucket:
+            return MarketType.WIND_SPEED, m.group("city").strip().title(), d, bucket_str, bucket
+
     return None
 
 
 # ── Gamma API discovery ───────────────────────────────────────────────────────
 
 # Maps MarketType → Gamma events tag_slug
+# Note: wind_speed tag_slug must be verified against live Gamma API before enabling.
 _TAG_SLUG: Dict[str, str] = {
     MarketType.TEMPERATURE.value:   "temperature",
     MarketType.PRECIPITATION.value: "precipitation",
     MarketType.SNOWFALL.value:      "snowfall",
+    MarketType.WIND_SPEED.value:    "wind",
 }
 
 

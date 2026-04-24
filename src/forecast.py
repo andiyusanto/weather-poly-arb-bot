@@ -170,8 +170,51 @@ class SnowForecast:
         return _normalize_probs(raw)
 
 
+# ── Wind speed forecast (KDE-based) ──────────────────────────────────────────
+
+KPH_TO_MPH = 0.621371
+
+@dataclass
+class WindForecast:
+    """
+    Wind speed forecast — Gaussian KDE over daily-max mph ensemble members.
+    Wind speed is continuous and rarely zero, so KDE is appropriate (unlike precip/snow).
+    """
+    city: str
+    target_date: date
+    combined_members_mph: List[float] = field(default_factory=list)
+    mean_f: float = 0.0      # mean wind speed in mph (duck-typed as mean_f for strategy compat)
+    std_f: float = 0.0       # std in mph
+    combined_kde: Optional[gaussian_kde] = None
+    confidence: float = 0.0
+
+    def bucket_probability(self, lower_mph: float, upper_mph: float) -> float:
+        lo = max(0.0, lower_mph)
+        if not self.combined_members_mph:
+            return 0.0
+        if self.combined_kde is not None:
+            # Bound open-ended upper at 3× the observed max for integration
+            hi = upper_mph if upper_mph < OPEN_END else float(np.max(self.combined_members_mph) * 3)
+            if lo >= hi:
+                return 0.0
+            try:
+                # integrate_box_1d avoids np.trapz (removed in NumPy 2.0)
+                prob = float(self.combined_kde.integrate_box_1d(lo, hi))
+                return max(0.0, min(1.0, prob))
+            except Exception:
+                pass
+        # Fallback: empirical counting (also used when KDE not fitted, e.g. low variance)
+        return _empirical_bucket_prob(np.array(self.combined_members_mph), lo, upper_mph)
+
+    def all_bucket_probabilities(
+        self, buckets: List[Tuple[float, float]]
+    ) -> Dict[Tuple[float, float], float]:
+        raw = {b: self.bucket_probability(b[0], b[1]) for b in buckets}
+        return _normalize_probs(raw)
+
+
 # Union type for all forecast variants — use in type hints
-AnyForecast = Union[EnsembleForecast, PrecipForecast, SnowForecast]
+AnyForecast = Union[EnsembleForecast, PrecipForecast, SnowForecast, WindForecast]
 
 
 # ── Bias correction store ─────────────────────────────────────────────────────
@@ -318,6 +361,16 @@ def _fit_kde(samples: List[float]) -> Optional[gaussian_kde]:
 
 def _temp_confidence(combined_std_f: float, n_models: int) -> float:
     spread_conf = float(np.clip(1.0 - (combined_std_f - 2.0) / 8.0, 0.1, 1.0))
+    model_bonus = min(0.1 * (n_models - 1), 0.2)
+    return float(np.clip(spread_conf + model_bonus, 0.0, 1.0))
+
+
+def _wind_confidence(std_mph: float, n_models: int) -> float:
+    """
+    Confidence for wind speed forecasts. Wind ensemble spread of ~5 mph = high confidence;
+    ~25 mph = near-minimum confidence. Maps [5, 25] mph std → [0.9, 0.1].
+    """
+    spread_conf = float(np.clip(1.0 - (std_mph - 5.0) / 20.0, 0.1, 1.0))
     model_bonus = min(0.1 * (n_models - 1), 0.2)
     return float(np.clip(spread_conf + model_bonus, 0.0, 1.0))
 
@@ -535,6 +588,80 @@ def get_snow_forecast(
     return result
 
 
+# ── Wind speed forecast ───────────────────────────────────────────────────────
+
+def get_wind_forecast(
+    city: str,
+    lat: float,
+    lon: float,
+    target_date: date,
+    models: Optional[List[str]] = None,
+    use_bias_correction: bool = True,
+) -> Optional[WindForecast]:
+    """
+    Fetch wind_speed_10m_max ensemble, convert kph→mph, apply bias correction,
+    fit KDE, return WindForecast.
+
+    Args:
+        city: City name for logging and bias lookup.
+        lat: Latitude.
+        lon: Longitude.
+        target_date: The date to forecast.
+        models: Override model list (defaults to settings.ensemble_model_list).
+        use_bias_correction: Whether to apply stored bias corrections.
+
+    Returns:
+        WindForecast with KDE fitted over mph members, or None if no data.
+    """
+    if models is None:
+        models = settings.ensemble_model_list
+
+    result = WindForecast(city=city, target_date=target_date)
+    all_weighted_mph: List[float] = []
+
+    for model, data in _fetch_models_parallel(lat, lon, target_date, models, "wind_speed_10m_max"):
+        if not data:
+            continue
+
+        raw_kph = data.get("wind_speed_10m_max", [])
+        if not raw_kph:
+            continue
+
+        raw_mph = [max(0.0, v * KPH_TO_MPH) for v in raw_kph]
+
+        bias = 0.0
+        if use_bias_correction and settings.bias_correction_days > 0:
+            bias = _bias_store.get_correction(city, model, "wind_speed", settings.bias_correction_days)
+
+        corrected_mph = [max(0.0, v + bias) for v in raw_mph]
+
+        w = DEFAULT_MODEL_WEIGHTS.get(model, 0.8)
+        repeats = max(1, round(w * 10))
+        all_weighted_mph.extend(corrected_mph * repeats)
+
+        mean_mph = float(np.mean(corrected_mph))
+        logger.debug(
+            f"  wind/{model}: {len(raw_kph)} members, mean={mean_mph:.1f}mph, bias={bias:+.1f}mph"
+        )
+
+    if not all_weighted_mph:
+        logger.warning(f"No wind forecast for {city} on {target_date}")
+        return None
+
+    arr = np.array(all_weighted_mph)
+    result.combined_members_mph = all_weighted_mph
+    result.mean_f = float(np.mean(arr))
+    result.std_f = float(np.std(arr))
+    result.combined_kde = _fit_kde(all_weighted_mph)
+    result.confidence = _wind_confidence(result.std_f, len(models))
+
+    logger.info(
+        f"Wind forecast {city} {target_date}: mean={result.mean_f:.1f}mph "
+        f"std={result.std_f:.1f}mph conf={result.confidence:.2f}"
+    )
+    return result
+
+
 # ── Public bias recording ─────────────────────────────────────────────────────
 
 def record_observed_temp(city: str, model: str, target_date: date,
@@ -553,3 +680,14 @@ def record_observed_snow(city: str, model: str, target_date: date,
                          forecast_mean_cm: float, observed_cm: float) -> None:
     _bias_store.record(city, model, "snowfall", target_date, forecast_mean_cm, observed_cm)
     logger.info(f"Bias recorded [snow]: {city}/{model} forecast={forecast_mean_cm:.2f}cm actual={observed_cm:.2f}cm error={observed_cm-forecast_mean_cm:+.2f}cm")
+
+
+def record_observed_wind(city: str, model: str, target_date: date,
+                         forecast_mean_mph: float, observed_mph: float) -> None:
+    """Record observed wind speed for 30-day rolling bias correction."""
+    _bias_store.record(city, model, "wind_speed", target_date, forecast_mean_mph, observed_mph)
+    logger.info(
+        f"Bias recorded [wind]: {city}/{model} "
+        f"forecast={forecast_mean_mph:.1f}mph actual={observed_mph:.1f}mph "
+        f"error={observed_mph - forecast_mean_mph:+.1f}mph"
+    )

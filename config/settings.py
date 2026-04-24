@@ -24,7 +24,7 @@ BIAS_DB = DATA_DIR / "bias_corrections.db"
 TRADES_DB = DATA_DIR / "trades.db"
 CITIES_YAML = CONFIG_DIR / "cities.yaml"
 
-VALID_MARKET_TYPES = {"temperature", "precipitation", "snowfall"}
+VALID_MARKET_TYPES = {"temperature", "precipitation", "snowfall", "wind_speed"}
 
 
 class Settings(BaseSettings):
