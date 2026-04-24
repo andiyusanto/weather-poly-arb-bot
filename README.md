@@ -134,6 +134,71 @@ gcloud compute instances create polymarket-bot \
 
 **Why STANDARD network tier?** At 30-minute scan intervals latency is not critical — STANDARD saves ~15% vs PREMIUM with no practical difference.
 
+### tmux (quick start, no root required)
+
+tmux is the fastest way to get the bot running persistently on a fresh VPS — no systemd config, no root, survives SSH disconnects.
+
+**Install tmux**
+
+```bash
+sudo apt install -y tmux
+```
+
+**First-time session setup**
+
+```bash
+# Create a named session for the bot
+tmux new -s polybot
+
+# Inside the session: activate venv and start
+cd /opt/weather-poly-arb-bot
+source .venv/bin/activate
+python run.py trade --dry-run
+```
+
+Detach with `Ctrl+B D`. The bot keeps running after you close SSH.
+
+**Reconnect later**
+
+```bash
+tmux attach -t polybot
+```
+
+**Useful tmux commands**
+
+| Command | What it does |
+|---|---|
+| `Ctrl+B D` | Detach (leave bot running) |
+| `Ctrl+B [` | Scroll mode — read logs with arrow keys; `Q` to exit |
+| `Ctrl+B C` | New window (e.g. for `python run.py scan`) |
+| `Ctrl+B 0` / `1` | Switch between windows |
+| `tmux ls` | List all sessions |
+| `tmux kill-session -t polybot` | Stop the bot and close session |
+
+**Split pane: bot + live logs side by side**
+
+```bash
+# Start the main bot pane
+tmux new -s polybot
+
+# Split vertically: Ctrl+B %
+# In the new pane, tail the log
+tail -f logs/bot_$(date +%Y%m%d).log
+```
+
+**Persistent tmux config (optional)**
+
+```bash
+cat >> ~/.tmux.conf << 'EOF'
+set -g mouse on              # scroll with mouse wheel
+set -g history-limit 50000   # keep more scrollback
+set -g status-right "%H:%M"
+EOF
+tmux source ~/.tmux.conf
+```
+
+> Use tmux for manual/development runs. For production (unattended, auto-restart on crash), prefer the systemd service below.
+
 ### Systemd service (auto-restart)
 
 ```ini
