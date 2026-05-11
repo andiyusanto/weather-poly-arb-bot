@@ -187,8 +187,12 @@ class TradeStore:
         """Add columns introduced after initial schema without dropping data."""
         existing = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
         for col, defn in [
-            ("shadow",      "INTEGER DEFAULT 0"),
-            ("resolved_at", "TEXT"),
+            ("shadow",        "INTEGER DEFAULT 0"),
+            ("resolved_at",   "TEXT"),
+            ("market_type",   "TEXT"),
+            ("target_date",   "TEXT"),
+            ("forecast_mean", "REAL"),     # mean of forecast variable at trade time
+            ("condition_id",  "TEXT"),     # Polymarket conditionId for resolution lookup
         ]:
             if col not in existing:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
@@ -199,14 +203,20 @@ class TradeStore:
         trade.setdefault("pnl", None)
         trade.setdefault("shadow", 0)
         trade.setdefault("resolved_at", None)
+        trade.setdefault("market_type", "")
+        trade.setdefault("target_date", "")
+        trade.setdefault("forecast_mean", None)
+        trade.setdefault("condition_id", "")
         with sqlite3.connect(self._db) as conn:
             conn.execute(
                 """
                 INSERT INTO trades
                     (market_id, token_id, city, bucket_label, model_prob, market_price, ev,
-                     confidence, size_usdc, side, dry_run, shadow, outcome, pnl, timestamp, resolved_at)
+                     confidence, size_usdc, side, dry_run, shadow, outcome, pnl, timestamp,
+                     resolved_at, market_type, target_date, forecast_mean, condition_id)
                 VALUES (:market_id,:token_id,:city,:bucket_label,:model_prob,:market_price,:ev,
-                        :confidence,:size_usdc,:side,:dry_run,:shadow,:outcome,:pnl,:timestamp,:resolved_at)
+                        :confidence,:size_usdc,:side,:dry_run,:shadow,:outcome,:pnl,:timestamp,
+                        :resolved_at,:market_type,:target_date,:forecast_mean,:condition_id)
                 """,
                 trade,
             )
@@ -259,7 +269,12 @@ class TradeStore:
         total = len(trades)
         resolved = [t for t in trades if t.get("outcome") is not None]
         open_count = total - len(resolved)
-        wins = [t for t in resolved if t.get("outcome", "").lower() == "yes"]
+        # A trade is a win when the side we bought matches the resolution.
+        def _won(t: dict) -> bool:
+            side = (t.get("side") or "yes").lower()
+            outcome = (t.get("outcome") or "").lower()
+            return (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no")
+        wins = [t for t in resolved if _won(t)]
         total_pnl = sum(t.get("pnl") or 0.0 for t in resolved)
         avg_ev = sum(t.get("ev") or 0.0 for t in trades) / max(total, 1)
         avg_conf = sum(t.get("confidence") or 0.0 for t in trades) / max(total, 1)

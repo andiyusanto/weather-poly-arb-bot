@@ -122,39 +122,47 @@ def execute_opportunity(
     Returns:
         Order result dict with status key.
     """
+    # Pick the actual token id we are buying (YES or NO).
+    trade_token = opp.trade_token_id or opp.bucket.token_id
+
     if shadow:
         # Shadow: full record, no real order — treated as dry_run at the CLOB layer
-        result = {"status": "shadow", "token_id": opp.bucket.token_id,
+        result = {"status": "shadow", "token_id": trade_token,
                   "size_usdc": opp.suggested_size_usdc, "order_id": "SHADOW"}
         mode = "shadow"
     elif dry_run or settings.dry_run:
         result = place_market_order(
-            token_id=opp.bucket.token_id,
-            side="BUY",
+            token_id=trade_token,
+            side=opp.side.upper(),
             size_usdc=opp.suggested_size_usdc,
             dry_run=True,
         )
         mode = "dry_run"
     else:
         result = place_market_order(
-            token_id=opp.bucket.token_id,
-            side="BUY",
+            token_id=trade_token,
+            side=opp.side.upper(),
             size_usdc=opp.suggested_size_usdc,
             dry_run=False,
         )
         mode = "live"
 
+    forecast_mean = getattr(opp.forecast, "mean_f", None)
     trade_record = dict(
         market_id=opp.market.market_id,
-        token_id=opp.bucket.token_id,
+        condition_id=opp.bucket.condition_id,
+        token_id=trade_token,
         city=opp.market.city,
+        market_type=opp.market.market_type.value,
+        target_date=opp.market.target_date.isoformat() if opp.market.target_date else "",
         bucket_label=opp.bucket.outcome_label,
         model_prob=opp.model_prob,
         market_price=opp.market_price,
         ev=opp.ev,
         confidence=opp.confidence,
         size_usdc=opp.suggested_size_usdc,
-        side="BUY",
+        side=opp.side,
+        forecast_mean=forecast_mean,
         dry_run=int((dry_run or settings.dry_run) and not shadow),
         shadow=int(shadow),
     )
@@ -231,16 +239,21 @@ def run_trading_cycle(
 
 # ── Shadow resolution ─────────────────────────────────────────────────────────
 
-def _compute_pnl(size_usdc: float, market_price: float, outcome: str) -> float:
+def _compute_pnl(
+    size_usdc: float, market_price: float, outcome: str, side: str = "yes"
+) -> float:
     """
-    Compute realised P&L for a BUY-YES position.
+    Compute realised P&L for a binary BUY position.
 
-    On YES: we paid market_price per share, collect $1.00 per share.
-            profit = size_usdc * (1.0 / market_price - 1.0)
-    On NO:  lose the entire stake.
-            profit = -size_usdc
+    side="yes" — we bought YES at market_price; win on outcome=yes.
+    side="no"  — we bought NO  at market_price; win on outcome=no.
+
+    Profit on the winning side: size_usdc * (1/market_price - 1).
+    Loss on the losing side:    -size_usdc.
     """
-    if outcome == "yes":
+    side = (side or "yes").lower()
+    won = (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no")
+    if won:
         if market_price and market_price > 0:
             return round(size_usdc * (1.0 / market_price - 1.0), 4)
         return 0.0
@@ -263,7 +276,8 @@ def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
     newly_resolved: List[dict] = []
 
     for trade in open_trades:
-        condition_id = trade.get("market_id", "")
+        # New rows store the conditionId in `condition_id`; legacy rows put it in `market_id`.
+        condition_id = trade.get("condition_id") or trade.get("market_id", "")
         outcome = fetch_market_resolution(condition_id)
 
         if outcome is None:
@@ -271,21 +285,38 @@ def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
                 logger.debug(f"Trade #{trade['id']} still open ({trade.get('city')} {trade.get('bucket_label')})")
             continue
 
+        side = (trade.get("side") or "yes").lower()
         pnl = _compute_pnl(
             size_usdc=float(trade.get("size_usdc") or 0.0),
             market_price=float(trade.get("market_price") or 0.5),
             outcome=outcome,
+            side=side,
         )
         _trade_store.update_outcome(trade["id"], outcome=outcome, pnl=pnl)
         trade["outcome"] = outcome
         trade["pnl"] = pnl
         newly_resolved.append(trade)
 
-        sign = "✅" if outcome == "yes" else "❌"
+        # Record the bias so future forecasts can apply rolling correction.
+        try:
+            from src.bias_recorder import record_bias_for_resolved_trade
+            record_bias_for_resolved_trade(trade)
+        except Exception as e:
+            logger.debug(f"bias record failed for trade #{trade['id']}: {e}")
+
+        sign = "✅" if (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no") else "❌"
         logger.info(
             f"{sign} Shadow #{trade['id']} {trade.get('city')} {trade.get('bucket_label')} "
-            f"→ {outcome.upper()} | P&L={fmt_usdc(pnl)}"
+            f"[{side.upper()}] → {outcome.upper()} | P&L={fmt_usdc(pnl)}"
         )
+
+    # Refresh empirical calibration after a batch of resolutions.
+    if newly_resolved:
+        try:
+            from src.calibration import rebuild_calibration
+            rebuild_calibration()
+        except Exception as e:
+            logger.debug(f"calibration rebuild failed: {e}")
 
     logger.success(f"Resolved {len(newly_resolved)} shadow trades this run.")
     return newly_resolved
@@ -310,6 +341,11 @@ def shadow_performance_report() -> None:
     _console.print(f"  Avg EV         : {fmt_pct(stats['avg_ev'])}")
     _console.print(f"  Avg Confidence : {fmt_pct(stats['avg_conf'])}\n")
 
+    def _won(t: dict) -> bool:
+        side = (t.get("side") or "yes").lower()
+        outcome = (t.get("outcome") or "").lower()
+        return (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no")
+
     # Per-city breakdown
     by_city: Dict[str, dict] = defaultdict(lambda: dict(n=0, wins=0, pnl=0.0, resolved=0))
     for t in stats["trades"]:
@@ -318,7 +354,7 @@ def shadow_performance_report() -> None:
         if t.get("outcome") is not None:
             by_city[city]["resolved"] += 1
             by_city[city]["pnl"] += t.get("pnl") or 0.0
-            if (t.get("outcome") or "").lower() == "yes":
+            if _won(t):
                 by_city[city]["wins"] += 1
 
     table = Table(title="By City", header_style="bold magenta", border_style="dim")

@@ -28,8 +28,10 @@ from src.utils import celsius_to_fahrenheit, http_retry, rate_limited_sleep
 
 OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 
-# Limit concurrent Open-Meteo requests across all threads
-_OPEN_METEO_SEM = threading.Semaphore(4)
+# Limit concurrent Open-Meteo requests across all threads. Free-tier hard
+# limit is ~30 concurrent — but with 3 models × 1 variable per city and many
+# cities, we hit the per-IP rate limit (429). Stay conservative.
+_OPEN_METEO_SEM = threading.Semaphore(2)
 
 DEFAULT_MODEL_WEIGHTS: Dict[str, float] = {
     "icon_seamless": 1.0,
@@ -102,7 +104,9 @@ class EnsembleForecast:
         if self.combined_kde is None or not self.combined_members_f:
             return 0.0
         pts = np.linspace(lower_f, upper_f, 200)
-        prob = float(np.trapz(self.combined_kde(pts), pts))
+        # np.trapz was removed in NumPy 2.0 — use trapezoid (also in scipy.integrate).
+        _trap = getattr(np, "trapezoid", None) or getattr(np, "trapz", None)
+        prob = float(_trap(self.combined_kde(pts), pts))
         return max(0.0, min(1.0, prob))
 
     def all_bucket_probabilities(
@@ -318,8 +322,18 @@ def _fetch_ensemble_vars(
     }
     try:
         with httpx.Client(timeout=20) as client:
-            resp = client.get(OPEN_METEO_ENSEMBLE_URL, params=params)
-            resp.raise_for_status()
+            for attempt in range(4):
+                resp = client.get(OPEN_METEO_ENSEMBLE_URL, params=params)
+                if resp.status_code == 429:
+                    wait = 2 ** attempt
+                    logger.debug(f"Open-Meteo 429 — backing off {wait}s [{model}/{variables}]")
+                    time.sleep(wait)
+                    continue
+                resp.raise_for_status()
+                break
+            else:
+                logger.warning(f"Open-Meteo persistently rate-limited [{model}/{variables}]")
+                return None
             data = resp.json()
 
         daily = data.get("daily", {})
@@ -359,10 +373,15 @@ def _fit_kde(samples: List[float]) -> Optional[gaussian_kde]:
 
 # ── Confidence scoring ────────────────────────────────────────────────────────
 
+def _conf_cap() -> float:
+    """Maximum confidence. Below 1.0 so the time-decay multiplier stays meaningful."""
+    return float(settings.confidence_max_cap)
+
+
 def _temp_confidence(combined_std_f: float, n_models: int) -> float:
     spread_conf = float(np.clip(1.0 - (combined_std_f - 2.0) / 8.0, 0.1, 1.0))
     model_bonus = min(0.1 * (n_models - 1), 0.2)
-    return float(np.clip(spread_conf + model_bonus, 0.0, 1.0))
+    return float(np.clip(spread_conf + model_bonus, 0.0, _conf_cap()))
 
 
 def _wind_confidence(std_mph: float, n_models: int) -> float:
@@ -372,7 +391,7 @@ def _wind_confidence(std_mph: float, n_models: int) -> float:
     """
     spread_conf = float(np.clip(1.0 - (std_mph - 5.0) / 20.0, 0.1, 1.0))
     model_bonus = min(0.1 * (n_models - 1), 0.2)
-    return float(np.clip(spread_conf + model_bonus, 0.0, 1.0))
+    return float(np.clip(spread_conf + model_bonus, 0.0, _conf_cap()))
 
 
 def _precip_confidence(members: np.ndarray, n_models: int) -> float:
@@ -395,7 +414,7 @@ def _precip_confidence(members: np.ndarray, n_models: int) -> float:
         spread_bonus = 0.0
 
     model_bonus = min(0.05 * (n_models - 1), 0.15)
-    return float(np.clip(decisiveness + spread_bonus + model_bonus, 0.0, 1.0))
+    return float(np.clip(decisiveness + spread_bonus + model_bonus, 0.0, _conf_cap()))
 
 
 # ── Temperature forecast ──────────────────────────────────────────────────────
@@ -449,6 +468,17 @@ def get_ensemble_forecast(
         logger.warning(f"No temperature forecast for {city} on {target_date}")
         return None
 
+    # Intraday refresh: when the target date is today and we already have
+    # observed high-temp-so-far, the realized high is bounded below by it.
+    # Tighten the ensemble around (max-so-far, ensemble-of-remaining) to
+    # reduce variance in the final hours.
+    if target_date == date.today():
+        intraday = _intraday_high_so_far(lat, lon)
+        if intraday is not None:
+            # Discard members that are below what already happened.
+            tightened = [max(intraday, v) for v in all_weighted]
+            all_weighted = tightened
+
     result.combined_members_f = all_weighted
     result.combined_kde = _fit_kde(all_weighted)
     result.mean_f = float(np.mean(all_weighted))
@@ -461,6 +491,44 @@ def get_ensemble_forecast(
         f"models={[m.model_name for m in result.model_results]}"
     )
     return result
+
+
+def _intraday_high_so_far(lat: float, lon: float) -> Optional[float]:
+    """
+    Fetch hourly temperatures so far today and return the max in °F. Used to
+    tighten the day-of forecast distribution by discarding ensemble members
+    that fall below what's already been observed.
+    """
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": lat,
+                    "longitude": lon,
+                    "hourly": "temperature_2m",
+                    "forecast_days": 1,
+                    "past_days": 0,
+                    "timezone": "UTC",
+                },
+            )
+            if resp.status_code != 200:
+                return None
+            data = resp.json().get("hourly", {})
+            times = data.get("time", [])
+            temps = data.get("temperature_2m", [])
+            if not times or not temps:
+                return None
+            now = time.gmtime()
+            today_str = f"{now.tm_year:04d}-{now.tm_mon:02d}-{now.tm_mday:02d}"
+            past_today = [
+                celsius_to_fahrenheit(t)
+                for ts, t in zip(times, temps)
+                if t is not None and ts.startswith(today_str) and ts <= time.strftime("%Y-%m-%dT%H:00", now)
+            ]
+            return float(max(past_today)) if past_today else None
+    except Exception:
+        return None
 
 
 # ── Precipitation forecast ────────────────────────────────────────────────────

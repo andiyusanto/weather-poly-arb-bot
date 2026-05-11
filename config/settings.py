@@ -57,11 +57,29 @@ class Settings(BaseSettings):
     max_trade_usdc: float = 50.0
     daily_max_usdc: float = 500.0
     min_confidence: float = 0.55
-    max_hours_to_resolution: float = 720.0
+    # Open-Meteo ensemble horizon is 16 days. Cap at 15d so every market we
+    # surface has at least one valid forecast member.
+    max_hours_to_resolution: float = 360.0
+    # Minimum 24h volume on a bucket before we trade it (USDC). Per CLAUDE.md
+    # liquidity rule — protects against thin precip/snow buckets.
+    min_bucket_volume_usdc: float = 500.0
+    # Tradable ask range. Below 0.03 or above 0.97 we are paying spread to
+    # market makers on near-resolved or barely-active markets — the model
+    # cannot generate edge there.
+    min_ask_price: float = 0.03
+    max_ask_price: float = 0.97
+    # Hard cap on accepted EV. Anything above this is almost always a bucket
+    # parsing error, near-resolution illiquidity, or stale price — never real.
+    max_ev_cap: float = 1.50
+    # Confidence is multiplicative; saturating at 1.0 obscures real differences.
+    # We cap at this value so the time-decay multiplier still has room.
+    confidence_max_cap: float = 0.85
+    # Diversification: max trades per (city, date) per cycle.
+    max_trades_per_city_day: int = 2
 
     # ── Market types to scan (comma-separated) ───────────────────────────────
     # Options: temperature, precipitation, snowfall
-    enabled_market_types: str = "temperature,precipitation,snowfall"
+    enabled_market_types: str = "temperature,precipitation,snowfall,wind_speed"
 
     # ── Forecast ────────────────────────────────────────────────────────────
     ensemble_models: str = "icon_seamless,gfs_seamless,ecmwf_ifs025"

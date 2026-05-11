@@ -32,13 +32,16 @@ class Opportunity:
     market: WeatherMarket
     bucket: WeatherBucket
     forecast: AnyForecast
-    model_prob: float
-    market_price: float         # ask price (0–1)
+    model_prob: float           # model probability for the side we are taking (yes or no)
+    market_price: float         # ask price for the side we are taking (0–1)
     ev: float
     confidence: float
     kelly_fraction: float
     suggested_size_usdc: float
+    side: str = "yes"           # "yes" or "no"
     hours_to_resolution: Optional[float] = None
+    # The token that will actually be purchased (yes or no token, depending on side).
+    trade_token_id: str = ""
 
     @property
     def edge_pct(self) -> str:
@@ -52,7 +55,7 @@ class Opportunity:
         mtype = self.market.market_type.emoji
         return (
             f"{mtype} {self.market.city} {self.market.target_date} "
-            f"[{self.bucket.outcome_label}]: "
+            f"[{self.bucket.outcome_label}|{self.side.upper()}]: "
             f"model={fmt_pct(self.model_prob)} mkt={fmt_pct(self.market_price)} "
             f"EV={fmt_pct(self.ev)} conf={fmt_pct(self.confidence)} "
             f"size=${self.suggested_size_usdc:.2f}"
@@ -147,6 +150,12 @@ def evaluate_market(
     kelly_mult: Optional[float] = None,
     max_usdc: Optional[float] = None,
 ) -> List[Opportunity]:
+    """
+    Evaluate every bucket in an event for both YES and NO trading sides.
+    Returns at most ONE opportunity per event (the highest-EV bucket/side),
+    because buckets within an event are mutually exclusive — we cannot
+    independently allocate Kelly to multiple buckets of the same event.
+    """
     kelly_mult = kelly_mult if kelly_mult is not None else settings.kelly_fraction
     max_usdc = max_usdc if max_usdc is not None else settings.max_trade_usdc
 
@@ -160,6 +169,10 @@ def evaluate_market(
     time_adj = time_confidence_adjustment(hours_left)
     adj_confidence = forecast.confidence * time_adj
 
+    # Apply per-city skill weighting if we have history (defaults to 1.0).
+    from src.calibration import city_skill_factor, calibrate_probability
+    adj_confidence *= city_skill_factor(market.city, market.market_type.value)
+
     effective_min_conf = _effective_min_confidence(market.market_type, min_confidence)
     if adj_confidence < effective_min_conf:
         logger.debug(
@@ -168,49 +181,89 @@ def evaluate_market(
         )
         return []
 
+    # Probability normalization is now meaningful: the bucket set covers the
+    # full mutually-exclusive outcome space for this event.
     probs = normalize_bucket_probs(forecast, market.buckets)
 
-    opportunities: List[Opportunity] = []
+    min_ask = settings.min_ask_price
+    max_ask = settings.max_ask_price
+    ev_cap = settings.max_ev_cap
+
+    candidate_opps: List[Opportunity] = []
     for bucket in market.buckets:
-        ask = bucket.best_ask
-        if ask <= 0.01 or ask >= 0.99:
+        raw_p_yes = probs.get(bucket.token_id, 0.0)
+        if raw_p_yes < 0.001 or raw_p_yes > 0.999:
+            # Degenerate prediction — likely a normalization artifact, skip.
             continue
 
-        model_prob = probs.get(bucket.token_id, 0.0)
-        if model_prob < 0.01:
+        # Apply empirical calibration learned from shadow history.
+        p_yes = calibrate_probability(raw_p_yes, market.market_type.value)
+        p_no = 1.0 - p_yes
+
+        # ── YES side ──
+        ask_yes = bucket.best_ask
+        ev_yes = -1.0
+        if min_ask <= ask_yes <= max_ask:
+            ev_yes = compute_ev(p_yes, ask_yes)
+
+        # ── NO side ──
+        ask_no = bucket.no_ask
+        ev_no = -1.0
+        if min_ask <= ask_no <= max_ask:
+            ev_no = compute_ev(p_no, ask_no)
+
+        # Pick the better side, if any.
+        if ev_yes >= ev_no:
+            side, side_prob, side_ask, side_ev = "yes", p_yes, ask_yes, ev_yes
+            trade_token = bucket.token_id
+        else:
+            side, side_prob, side_ask, side_ev = "no", p_no, ask_no, ev_no
+            trade_token = bucket.no_token_id or bucket.token_id
+
+        if side_ev < min_ev:
             continue
 
-        ev = compute_ev(model_prob, ask)
-        if ev < min_ev:
+        if side_ev > ev_cap:
+            # Suspicious EV — usually means market is near-resolved or priced
+            # in a way the model can't actually evaluate. Skip rather than trade.
             logger.debug(
-                f"  [{market.market_type.value}] {bucket.outcome_label}: "
-                f"model={model_prob:.3f} ask={ask:.3f} EV={ev:.3f} < {min_ev}"
+                f"  [{market.market_type.value}] {bucket.outcome_label} {side.upper()}: "
+                f"EV={side_ev:.1%} > cap {ev_cap:.0%} — skipped (likely stale/illiquid)"
             )
             continue
 
-        size = suggested_position_size(model_prob, ask, bankroll, kelly_mult, max_usdc)
-        kf = kelly_fraction(model_prob, ask)
+        size = suggested_position_size(side_prob, side_ask, bankroll, kelly_mult, max_usdc)
+        kf = kelly_fraction(side_prob, side_ask)
 
-        opp = Opportunity(
+        candidate_opps.append(Opportunity(
             market=market,
             bucket=bucket,
             forecast=forecast,
-            model_prob=model_prob,
-            market_price=ask,
-            ev=ev,
+            model_prob=side_prob,
+            market_price=side_ask,
+            ev=side_ev,
             confidence=adj_confidence,
             kelly_fraction=kf,
             suggested_size_usdc=size,
+            side=side,
+            trade_token_id=trade_token,
             hours_to_resolution=hours_left,
-        )
-        opportunities.append(opp)
-        logger.info(
-            f"  EDGE [{market.market_type.emoji}]: {bucket.outcome_label} "
-            f"model={model_prob:.1%} ask={ask:.1%} EV={ev:.1%} "
-            f"conf={adj_confidence:.1%} size=${size:.2f}"
-        )
+        ))
 
-    return opportunities
+    if not candidate_opps:
+        return []
+
+    # Joint Kelly: buckets within an event are mutually exclusive, so allocate
+    # to a SINGLE position per event — the highest-EV side/bucket.
+    candidate_opps.sort(key=lambda o: o.ev, reverse=True)
+    best = candidate_opps[0]
+
+    logger.info(
+        f"  EDGE [{market.market_type.emoji}]: {best.bucket.outcome_label} {best.side.upper()} "
+        f"model={best.model_prob:.1%} ask={best.market_price:.1%} EV={best.ev:.1%} "
+        f"conf={best.confidence:.1%} size=${best.suggested_size_usdc:.2f}"
+    )
+    return [best]
 
 
 # ── Portfolio-level risk check ────────────────────────────────────────────────

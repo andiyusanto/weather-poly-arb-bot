@@ -191,6 +191,22 @@ def run_scan(
                 continue
         active_markets.append(m)
 
+    # Liquidity filter — drop buckets below the volume floor. Precip/snow
+    # buckets often sit at ~$0 of 24h volume; trading those is a coin flip.
+    min_vol = settings.min_bucket_volume_usdc
+    liquid_markets: List[WeatherMarket] = []
+    skipped_thin = 0
+    for m in active_markets:
+        kept = [b for b in m.buckets if b.volume_usdc >= min_vol]
+        if kept:
+            m.buckets = kept
+            liquid_markets.append(m)
+        else:
+            skipped_thin += 1
+    if skipped_thin:
+        logger.info(f"Liquidity filter (vol>=${min_vol:.0f}): dropped {skipped_thin} thin markets")
+    active_markets = liquid_markets
+
     type_counts: Dict[str, int] = {}
     for m in active_markets:
         k = m.market_type.value
@@ -201,7 +217,7 @@ def run_scan(
         + ", ".join(f"{k}={v}" for k, v in sorted(type_counts.items()))
     )
 
-    # Enrich with live prices
+    # Backfill any buckets without a price (most are pre-priced from Gamma)
     active_markets = enrich_with_prices(active_markets)
 
     # Geocode new cities
@@ -236,7 +252,10 @@ def run_scan(
             return key, None
 
     n_keys = len(forecast_keys)
-    workers = min(settings.max_concurrency, n_keys) if n_keys else 1
+    # Each forecast fans out to 3 models × 1+ variable internally, so
+    # high outer parallelism quickly exceeds Open-Meteo's per-IP rate limit.
+    # Cap outer workers at 4 to keep us under ~12 concurrent upstream requests.
+    workers = min(4, settings.max_concurrency, n_keys) if n_keys else 1
     logger.info(f"Fetching {n_keys} forecasts with {workers} parallel workers...")
     t_forecast = time.time()
 
@@ -263,6 +282,25 @@ def run_scan(
         opportunities.extend(market_opps)
 
     opportunities.sort(key=lambda o: o.ev, reverse=True)
+
+    # Diversification: cap trades per (city, date) so a single hot city
+    # doesn't dominate the day's allocation. Highest-EV opps are kept first
+    # since the list is already sorted descending.
+    max_per = settings.max_trades_per_city_day
+    if max_per > 0:
+        seen: Dict[Tuple[str, date], int] = {}
+        kept: List[Opportunity] = []
+        dropped = 0
+        for o in opportunities:
+            key = (o.market.city, o.market.target_date)
+            if seen.get(key, 0) >= max_per:
+                dropped += 1
+                continue
+            seen[key] = seen.get(key, 0) + 1
+            kept.append(o)
+        if dropped:
+            logger.info(f"Diversification cap (≤{max_per}/city/day): dropped {dropped}")
+        opportunities = kept
 
     type_opp_counts: Dict[str, int] = {}
     for o in opportunities:
@@ -323,6 +361,7 @@ def display_opportunities(result: ScanResult, top_n: int = 20) -> None:
     table.add_column("City", style="cyan", no_wrap=True)
     table.add_column("Date", no_wrap=True)
     table.add_column("Bucket", no_wrap=True)
+    table.add_column("Side", no_wrap=True)
     table.add_column("Model%", justify="right", style="green")
     table.add_column("Mkt%", justify="right", style="red")
     table.add_column("EV", justify="right", style="bold green")
@@ -337,12 +376,14 @@ def display_opportunities(result: ScanResult, top_n: int = 20) -> None:
             else "?"
         )
         ev_style = "bold green" if opp.ev >= 0.35 else "green"
+        side_style = "green" if opp.side == "yes" else "red"
         mtype = opp.market.market_type
         table.add_row(
             f"{mtype.emoji} {mtype.value[:4]}",
             opp.market.city,
             str(opp.market.target_date),
             opp.bucket.outcome_label,
+            f"[{side_style}]{opp.side.upper()}[/{side_style}]",
             fmt_pct(opp.model_prob),
             fmt_pct(opp.market_price),
             f"[{ev_style}]{fmt_pct(opp.ev)}[/{ev_style}]",
