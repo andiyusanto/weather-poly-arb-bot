@@ -491,7 +491,7 @@ Pick **one** of the options below.
 cat > ~/resolve-shadow.sh << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-cd /opt/weather-poly-arb-bot                # adjust to your install path
+cd /home/yusantoandi/weather-poly-arb-bot                # adjust to your install path
 source .venv/bin/activate
 python run.py resolve-shadow >> logs/cron_resolve.log 2>&1
 python run.py shadow-pnl     >> logs/cron_resolve.log 2>&1
