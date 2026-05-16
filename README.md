@@ -499,7 +499,7 @@ EOF
 chmod +x ~/resolve-shadow.sh
 
 # 2. Install the cron entry (06:00 UTC daily).
-( crontab -l 2>/dev/null; echo "0 6 * * * /home/$USER/resolve-shadow.sh" ) | crontab -
+( crontab -l 2>/dev/null; echo "0 6 * * * /home/yusantoandi/resolve-shadow.sh" ) | crontab -
 
 # 3. Verify it's registered.
 crontab -l
