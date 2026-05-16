@@ -420,14 +420,64 @@ python run.py trade --dry-run --once   # single dry-run cycle and exit
 Shadow mode sits between dry-run and live. It submits no orders but records every decision to `trades.db`, then resolves each position once the market closes. Use it to confirm your model has real edge on live Polymarket prices before risking capital.
 
 ```bash
-# Step 1 — run shadow for ≥1 week on schedule (every 30 min)
+# Step 1 — run shadow continuously (records decisions, no orders)
 python run.py trade --shadow
 
-# Step 2 — check for newly resolved markets and compute P&L (run daily)
+# Step 2 — close out resolved markets, compute P&L, feed the bias/calibration tables (run daily)
 python run.py resolve-shadow
 
 # Step 3 — view win rate, total P&L, per-city breakdown
 python run.py shadow-pnl
+```
+
+#### `python run.py trade --shadow` — paper-trading loop
+
+Runs the full scan→evaluate→size→record pipeline, but never submits an order to the CLOB.
+
+Each cycle:
+1. **Scan** — fetch active weather markets from Gamma; filter by `MAX_HOURS_TO_RESOLUTION` and `MIN_BUCKET_VOLUME_USDC`.
+2. **Forecast** — pull ensemble forecasts (ECMWF / ICON / GFS) for each (city, target_date) and apply rolling bias correction.
+3. **Evaluate** — compute EV, confidence, and Kelly-sized stake per bucket; keep those clearing `MIN_EV_THRESHOLD` and `MIN_CONFIDENCE`.
+4. **Apply daily limit** — cap by `DAILY_MAX_USDC`. Shadow trades are **not** counted toward this cap.
+5. **"Execute"** — `execute_opportunity()` short-circuits: it returns `{"status": "shadow", "order_id": "SHADOW"}` instead of calling `place_market_order`.
+6. **Record** — inserts a row into `trades.db` with `shadow=1`, `outcome=NULL`, `pnl=NULL`, plus `condition_id`, `forecast_mean`, and the market price at entry (needed for later resolution and P&L).
+7. **Telegram alert** tagged 🟡 SHADOW.
+8. Sleeps `--interval` minutes and repeats (use `--once` to run a single cycle).
+
+Difference vs `--dry-run`: dry-run logs and forgets; shadow **persists** the decision so the eventual outcome can be matched against the model's prediction.
+
+#### `python run.py resolve-shadow` — close out paper trades
+
+Looks at every `shadow=1, outcome IS NULL` row and asks Gamma whether the underlying market has resolved.
+
+For each open shadow trade:
+1. `fetch_market_resolution(condition_id)` → `"yes"`, `"no"`, or `None` (still open).
+2. If resolved, P&L is computed from the entry ask price:
+   - Win: `size_usdc * (1/market_price - 1)` (e.g., bought YES at 20¢, won → +4× stake)
+   - Loss: `-size_usdc`
+3. Writes `outcome`, `pnl`, and `resolved_at` back to the row.
+4. **Bias recorder** (`bias_recorder.py`) fetches the actual observed weather from Open-Meteo's archive endpoint and stores `(observed − forecast)` into `bias_corrections.db`. Without this, the rolling correction in `forecast.py` has no data and every forecast keeps using `bias=+0.0`.
+5. **Calibration rebuild** refreshes the empirical curve in `calibration.db`.
+
+> ⚠️ **Run this on a cron.** If you skip it, `bias_corrections.db` and `calibration.db` stay empty, forecasts run uncorrected, and shadow EVs become meaningless. A daily run after the prior day's markets settle (e.g. 06:00 UTC) is the minimum.
+
+#### `python run.py shadow-pnl` — edge-validation dashboard
+
+Read-only report against `trades.db`. Prints:
+- **Header stats** — total trades, resolved vs open, win rate, total P&L, avg EV, avg confidence.
+- **By-city table** — per-city trade count, resolved count, win rate, P&L (sorted by P&L so the worst cities surface first).
+- **Recent shadow trades** — last 20 rows with model%, ask price, EV, size, outcome, and color-coded P&L.
+
+If avg realised P&L per trade is far below what avg EV predicted, the model is overconfident — fix calibration before going live.
+
+#### Typical operating rhythm
+
+```bash
+# Continuous (systemd / tmux):
+python run.py trade --shadow --interval 60
+
+# Daily cron at e.g. 06:00 UTC:
+python run.py resolve-shadow && python run.py shadow-pnl
 ```
 
 **Go live only when** `shadow-pnl` shows:
