@@ -480,6 +480,75 @@ python run.py trade --shadow --interval 60
 python run.py resolve-shadow && python run.py shadow-pnl
 ```
 
+#### Setting up the daily cron
+
+Pick **one** of the options below.
+
+**Option A — user crontab (simplest, works on any VPS)**
+
+```bash
+# 1. Create a wrapper that activates the venv and runs both commands.
+cat > ~/resolve-shadow.sh << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cd /opt/weather-poly-arb-bot                # adjust to your install path
+source .venv/bin/activate
+python run.py resolve-shadow >> logs/cron_resolve.log 2>&1
+python run.py shadow-pnl     >> logs/cron_resolve.log 2>&1
+EOF
+chmod +x ~/resolve-shadow.sh
+
+# 2. Install the cron entry (06:00 UTC daily).
+( crontab -l 2>/dev/null; echo "0 6 * * * /home/$USER/resolve-shadow.sh" ) | crontab -
+
+# 3. Verify it's registered.
+crontab -l
+```
+
+> Cron runs with a minimal environment. Always `cd` into the project and `source .venv/bin/activate` inside the wrapper — never rely on the cron daemon to pick up your shell's `$PATH` or virtualenv.
+
+**Option B — systemd timer (preferred on the production VM alongside the `polymarket-bot.service`)**
+
+```ini
+# /etc/systemd/system/polymarket-resolve.service
+[Unit]
+Description=Polymarket weather bot — resolve shadow trades & print P&L
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=polybot
+WorkingDirectory=/opt/weather-poly-arb-bot
+EnvironmentFile=/opt/weather-poly-arb-bot/.env
+ExecStart=/opt/weather-poly-arb-bot/.venv/bin/python run.py resolve-shadow
+ExecStart=/opt/weather-poly-arb-bot/.venv/bin/python run.py shadow-pnl
+StandardOutput=append:/opt/weather-poly-arb-bot/logs/cron_resolve.log
+StandardError=append:/opt/weather-poly-arb-bot/logs/cron_resolve.log
+```
+
+```ini
+# /etc/systemd/system/polymarket-resolve.timer
+[Unit]
+Description=Run resolve-shadow daily at 06:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 UTC
+Persistent=true                # catches up if the VM was off at trigger time
+Unit=polymarket-resolve.service
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now polymarket-resolve.timer
+systemctl list-timers polymarket-resolve.timer   # confirm next run
+journalctl -u polymarket-resolve.service -n 50   # last run output
+```
+
+**Why 06:00 UTC?** Polymarket weather markets settle shortly after midnight local time. By 06:00 UTC the prior-day's APAC and European markets are resolved; the US-evening markets will be picked up by the following day's run. Adjust if your `ENABLED_CITIES` skew elsewhere.
+
 **Go live only when** `shadow-pnl` shows:
 - Win rate ≥ 55% on ≥ 30 resolved trades
 - Total P&L positive
