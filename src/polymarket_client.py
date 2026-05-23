@@ -723,33 +723,67 @@ def enrich_with_prices(markets: List[WeatherMarket]) -> List[WeatherMarket]:
 
 # ── Market resolution ────────────────────────────────────────────────────────
 
+def _winner_outcome(tokens: list) -> Optional[str]:
+    """
+    Determine the winning outcome of a binary bucket from CLOB ``tokens[]``.
+
+    A token wins when ``winner is True`` or its ``price`` is ≈ 1. Returns
+    'yes'/'no' for the winning side, or None when no token has resolved
+    (market still pending finalization) or the payload is malformed.
+    """
+    if not isinstance(tokens, list) or not tokens:
+        return None
+
+    def _is_winner(tok: dict) -> bool:
+        if tok.get("winner") is True:
+            return True
+        return _safe_float(tok.get("price")) >= 0.99
+
+    winning = next((t for t in tokens if isinstance(t, dict) and _is_winner(t)), None)
+    if winning is None:
+        return None
+    outcome = (winning.get("outcome") or "").strip().lower()
+    return outcome if outcome in ("yes", "no") else None
+
+
 def fetch_market_resolution(condition_id: str) -> Optional[str]:
     """
-    Query Gamma API for the resolution outcome of a single market.
+    Query the CLOB for the resolution outcome of a single binary bucket market.
+
+    Resolution is read from the CLOB ``/markets/{conditionId}`` endpoint, whose
+    ``tokens[]`` carry a per-token ``winner`` flag (and ``price`` 1/0). This is
+    the only source that works by conditionId and is *resolution-engine-agnostic*
+    — it reflects the final outcome whether the market was graded by UMA's
+    optimistic oracle, Chainlink Data Streams, or the Polymarket team.
+
+    We deliberately do NOT gate on ``closed``/``active``: observed payloads carry
+    inconsistent combinations (e.g. ``closed:true, active:true`` on a finalized
+    market). The unambiguous signal is a token with ``winner == true`` (or
+    ``price`` ≈ 1). Absent that, the market is treated as still-pending — which
+    correctly handles the MOOV2 propose→dispute→finalize window where trading has
+    stopped but the outcome is not yet final.
 
     Args:
-        condition_id: The market's conditionId (hex string stored in trades.market_id).
+        condition_id: The market's hex conditionId (stored in ``trades.condition_id``).
 
     Returns:
-        'yes' or 'no' when the market has resolved, None if still open or unknown.
+        'yes' if the market's "Yes" outcome won, 'no' if "No" won, or None when
+        the market is not yet finalized or the lookup failed.
     """
     if not condition_id:
         return None
     try:
         with httpx.Client(timeout=15) as client:
-            resp = client.get(f"{settings.gamma_api_host}/markets/{condition_id}")
+            resp = client.get(f"{settings.clob_host}/markets/{condition_id}")
             if resp.status_code != 200:
+                logger.debug(f"Resolution fetch HTTP {resp.status_code} [{condition_id}]")
                 return None
             data = resp.json()
-            if isinstance(data, list):
-                data = data[0] if data else {}
             if not isinstance(data, dict):
+                logger.debug(f"Resolution fetch: unexpected payload type [{condition_id}]")
                 return None
-            # Market must be closed/resolved — skip still-open markets
-            if not (data.get("closed") or data.get("resolved")):
-                return None
-            outcome = (data.get("outcome") or "").strip().lower()
-            return outcome if outcome in ("yes", "no") else None
+            # None ⇒ not yet finalized (trading may have stopped); a winner ⇒ 'yes'/'no'.
+            return _winner_outcome(data.get("tokens") or [])
     except Exception as e:
         logger.debug(f"Resolution fetch failed [{condition_id}]: {e}")
         return None

@@ -25,7 +25,7 @@ from config.settings import TRADES_DB, settings
 from src.polymarket_client import fetch_market_resolution, place_market_order
 from src.scanner import ScanResult, display_opportunities, run_scan
 from src.strategy import Opportunity, apply_daily_limit
-from src.utils import TradeStore, fmt_pct, fmt_usdc, now_utc
+from src.utils import TradeStore, fmt_pct, fmt_usdc, now_utc, rate_limited_sleep
 
 _trade_store = TradeStore(TRADES_DB)
 _console = Console()
@@ -274,13 +274,22 @@ def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
 
     logger.info(f"Checking resolution for {len(open_trades)} open shadow trades…")
     newly_resolved: List[dict] = []
+    still_pending = 0
 
-    for trade in open_trades:
+    for i, trade in enumerate(open_trades, start=1):
         # New rows store the conditionId in `condition_id`; legacy rows put it in `market_id`.
         condition_id = trade.get("condition_id") or trade.get("market_id", "")
         outcome = fetch_market_resolution(condition_id)
 
+        # Polite throttle: this loop fans out one CLOB GET per open trade and the
+        # backfill can be hundreds of rows. Keep well under any rate limit.
+        rate_limited_sleep(0.2)
+        if i % 50 == 0:
+            logger.info(f"  …{i}/{len(open_trades)} checked "
+                        f"(resolved={len(newly_resolved)} pending={still_pending})")
+
         if outcome is None:
+            still_pending += 1
             if verbose:
                 logger.debug(f"Trade #{trade['id']} still open ({trade.get('city')} {trade.get('bucket_label')})")
             continue
@@ -318,7 +327,10 @@ def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
         except Exception as e:
             logger.debug(f"calibration rebuild failed: {e}")
 
-    logger.success(f"Resolved {len(newly_resolved)} shadow trades this run.")
+    logger.success(
+        f"Resolved {len(newly_resolved)} shadow trades this run "
+        f"({still_pending} still pending finalization)."
+    )
     return newly_resolved
 
 
