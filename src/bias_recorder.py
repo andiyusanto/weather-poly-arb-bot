@@ -9,6 +9,7 @@ and stores ``observed - forecast`` per (city, model, variable, target_date).
 
 from __future__ import annotations
 
+import time
 from datetime import date as date_type, datetime
 from typing import Optional
 
@@ -39,30 +40,57 @@ _BIAS_VAR = {
 
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
+# An observation depends only on (lat, lon, date, variable) — never on the bucket.
+# Many shadow trades share the same city+date, so during a backfill the same
+# observation is requested dozens of times. Memoize per-process to collapse those
+# into a single Open-Meteo call (the archive API is aggressively rate-limited).
+_observed_cache: dict[tuple, Optional[float]] = {}
+
 
 def _fetch_observed(lat: float, lon: float, target: date_type, variable: str) -> Optional[float]:
-    """Fetch a single daily observation from the Open-Meteo archive."""
+    """
+    Fetch a single daily observation from the Open-Meteo archive.
+
+    Memoized by (lat, lon, date, field); on HTTP 429 backs off and retries a few
+    times rather than stalling to the socket timeout. Returns None on miss/failure
+    (None results are NOT cached, so a transient rate-limit can be retried later).
+    """
     field = _ARCHIVE_VAR.get(variable)
     if not field:
         return None
+
+    key = (round(lat, 4), round(lon, 4), str(target), field)
+    if key in _observed_cache:
+        return _observed_cache[key]
+
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start_date": str(target),
+        "end_date": str(target),
+        "daily": field,
+        "timezone": "UTC",
+    }
     try:
         with httpx.Client(timeout=15) as client:
-            resp = client.get(ARCHIVE_URL, params={
-                "latitude": lat,
-                "longitude": lon,
-                "start_date": str(target),
-                "end_date": str(target),
-                "daily": field,
-                "timezone": "UTC",
-            })
-            if resp.status_code != 200:
-                logger.debug(f"archive fetch HTTP {resp.status_code} for {variable}/{target}")
-                return None
-            data = resp.json().get("daily", {}).get(field, [])
-            if not data:
-                return None
-            v = data[0]
-            return float(v) if v is not None else None
+            for attempt in range(3):
+                resp = client.get(ARCHIVE_URL, params=params)
+                if resp.status_code == 429:
+                    wait = 2 * (attempt + 1)
+                    logger.debug(f"archive 429 for {variable}/{target}; backoff {wait}s")
+                    time.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    logger.debug(f"archive fetch HTTP {resp.status_code} for {variable}/{target}")
+                    return None
+                data = resp.json().get("daily", {}).get(field, [])
+                if not data or data[0] is None:
+                    return None
+                value = float(data[0])
+                _observed_cache[key] = value  # cache only successful reads
+                return value
+            logger.debug(f"archive persistently rate-limited for {variable}/{target}")
+            return None
     except Exception as e:
         logger.debug(f"archive fetch failed: {e}")
         return None
