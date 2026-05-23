@@ -12,7 +12,11 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from src.polymarket_client import _winner_outcome, fetch_market_resolution
+from src.polymarket_client import (
+    _winner_outcome,
+    fetch_market_resolution,
+    fetch_market_resolutions,
+)
 
 # ── Real captured payloads ─────────────────────────────────────────────────────
 
@@ -83,3 +87,25 @@ def test_fetch_resolution_http_error() -> None:
 
 def test_fetch_resolution_empty_condition() -> None:
     assert fetch_market_resolution("") is None
+
+
+# ── fetch_market_resolutions (batch + dedupe) ───────────────────────────────────
+
+def test_batch_dedupes_and_maps() -> None:
+    calls: list[str] = []
+
+    def fake(_client, cid):  # noqa: ANN001
+        calls.append(cid)
+        return {"0xa": "no", "0xb": "yes"}.get(cid)
+
+    # "0xa" appears 3x and "" is dropped; each unique id fetched exactly once.
+    with patch("src.polymarket_client._resolution_via_client", side_effect=fake):
+        out = fetch_market_resolutions(["0xa", "0xb", "0xa", "0xa", ""])
+
+    assert out == {"0xa": "no", "0xb": "yes"}
+    assert sorted(calls) == ["0xa", "0xb"]
+
+
+def test_batch_empty_input() -> None:
+    assert fetch_market_resolutions([]) == {}
+    assert fetch_market_resolutions(["", ""]) == {}

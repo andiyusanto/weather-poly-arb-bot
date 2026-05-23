@@ -772,21 +772,59 @@ def fetch_market_resolution(condition_id: str) -> Optional[str]:
     """
     if not condition_id:
         return None
+    with httpx.Client(timeout=15) as client:
+        return _resolution_via_client(client, condition_id)
+
+
+def _resolution_via_client(client: httpx.Client, condition_id: str) -> Optional[str]:
+    """Resolve a single conditionId reusing an existing (keep-alive) client."""
+    if not condition_id:
+        return None
     try:
-        with httpx.Client(timeout=15) as client:
-            resp = client.get(f"{settings.clob_host}/markets/{condition_id}")
-            if resp.status_code != 200:
-                logger.debug(f"Resolution fetch HTTP {resp.status_code} [{condition_id}]")
-                return None
-            data = resp.json()
-            if not isinstance(data, dict):
-                logger.debug(f"Resolution fetch: unexpected payload type [{condition_id}]")
-                return None
-            # None ⇒ not yet finalized (trading may have stopped); a winner ⇒ 'yes'/'no'.
-            return _winner_outcome(data.get("tokens") or [])
+        resp = client.get(f"{settings.clob_host}/markets/{condition_id}")
+        if resp.status_code != 200:
+            logger.debug(f"Resolution fetch HTTP {resp.status_code} [{condition_id}]")
+            return None
+        data = resp.json()
+        if not isinstance(data, dict):
+            logger.debug(f"Resolution fetch: unexpected payload type [{condition_id}]")
+            return None
+        # None ⇒ not yet finalized (trading may have stopped); a winner ⇒ 'yes'/'no'.
+        return _winner_outcome(data.get("tokens") or [])
     except Exception as e:
         logger.debug(f"Resolution fetch failed [{condition_id}]: {e}")
         return None
+
+
+def fetch_market_resolutions(
+    condition_ids: List[str], max_workers: int = 5
+) -> Dict[str, Optional[str]]:
+    """
+    Resolve many conditionIds at once, deduped and concurrently.
+
+    Uses one keep-alive ``httpx.Client`` shared across a small thread pool so
+    TLS/DNS is reused and we stay well under CLOB rate limits. Duplicate ids are
+    fetched only once. Returns ``{condition_id: 'yes'|'no'|None}`` for every
+    unique id (None ⇒ unresolved/failed).
+
+    Args:
+        condition_ids: Hex conditionIds (duplicates allowed; deduped internally).
+        max_workers: Concurrent requests. Kept low (default 5) — CLOB throttles.
+    """
+    unique = [c for c in dict.fromkeys(condition_ids) if c]
+    if not unique:
+        return {}
+
+    results: Dict[str, Optional[str]] = {}
+    limits = httpx.Limits(max_keepalive_connections=max_workers, max_connections=max_workers)
+    with httpx.Client(timeout=15, limits=limits) as client:
+        def _one(cid: str) -> Tuple[str, Optional[str]]:
+            return cid, _resolution_via_client(client, cid)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for cid, outcome in pool.map(_one, unique):
+                results[cid] = outcome
+    return results
 
 
 # ── Order placement ───────────────────────────────────────────────────────────

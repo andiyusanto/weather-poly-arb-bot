@@ -22,10 +22,10 @@ from rich.console import Console
 from rich.table import Table
 
 from config.settings import TRADES_DB, settings
-from src.polymarket_client import fetch_market_resolution, place_market_order
+from src.polymarket_client import fetch_market_resolutions, place_market_order
 from src.scanner import ScanResult, display_opportunities, run_scan
 from src.strategy import Opportunity, apply_daily_limit
-from src.utils import TradeStore, fmt_pct, fmt_usdc, now_utc, rate_limited_sleep
+from src.utils import TradeStore, fmt_pct, fmt_usdc, now_utc
 
 _trade_store = TradeStore(TRADES_DB)
 _console = Console()
@@ -262,7 +262,7 @@ def _compute_pnl(
 
 def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
     """
-    Check Gamma API for resolution of every open shadow trade and update the DB.
+    Resolve every open shadow trade against the CLOB and update the DB.
 
     Returns:
         List of newly resolved trade dicts (with outcome and pnl filled in).
@@ -272,21 +272,25 @@ def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
         logger.info("No open shadow trades to resolve.")
         return []
 
-    logger.info(f"Checking resolution for {len(open_trades)} open shadow trades…")
+    # Many trades bet the same bucket, so resolutions are deduped by conditionId
+    # and fetched concurrently over a keep-alive client (CLOB is slow per call).
+    def _cid(t: dict) -> str:
+        # New rows store the conditionId in `condition_id`; legacy rows in `market_id`.
+        return t.get("condition_id") or t.get("market_id", "")
+
+    cond_ids = [_cid(t) for t in open_trades]
+    n_unique = len({c for c in cond_ids if c})
+    logger.info(
+        f"Checking resolution for {len(open_trades)} open shadow trades "
+        f"({n_unique} unique markets)…"
+    )
+    resolutions = fetch_market_resolutions(cond_ids)
+
     newly_resolved: List[dict] = []
     still_pending = 0
 
-    for i, trade in enumerate(open_trades, start=1):
-        # New rows store the conditionId in `condition_id`; legacy rows put it in `market_id`.
-        condition_id = trade.get("condition_id") or trade.get("market_id", "")
-        outcome = fetch_market_resolution(condition_id)
-
-        # Polite throttle: this loop fans out one CLOB GET per open trade and the
-        # backfill can be hundreds of rows. Keep well under any rate limit.
-        rate_limited_sleep(0.2)
-        if i % 50 == 0:
-            logger.info(f"  …{i}/{len(open_trades)} checked "
-                        f"(resolved={len(newly_resolved)} pending={still_pending})")
+    for trade in open_trades:
+        outcome = resolutions.get(_cid(trade))
 
         if outcome is None:
             still_pending += 1
