@@ -38,7 +38,12 @@ _BIAS_VAR = {
     "wind_speed":    "wind_speed",
 }
 
-ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
+# Observed daily values are read from the *forecast* host's past-date range, NOT
+# archive-api.open-meteo.com. The archive host resolves IPv6-first and is
+# unreachable from the IPv4-only APAC trading zones (ENETUNREACH), whereas
+# api.open-meteo.com is reachable (~0.1s) and returns the identical daily schema.
+# It serves recent past dates (well within the days-old window we resolve over).
+OBSERVED_URL = "https://api.open-meteo.com/v1/forecast"
 
 # An observation depends only on (lat, lon, date, variable) — never on the bucket.
 # Many shadow trades share the same city+date, so during a backfill the same
@@ -74,7 +79,7 @@ def _fetch_observed(lat: float, lon: float, target: date_type, variable: str) ->
     try:
         with httpx.Client(timeout=15) as client:
             for attempt in range(3):
-                resp = client.get(ARCHIVE_URL, params=params)
+                resp = client.get(OBSERVED_URL, params=params)
                 if resp.status_code == 429:
                     wait = 2 * (attempt + 1)
                     logger.debug(f"archive 429 for {variable}/{target}; backoff {wait}s")
