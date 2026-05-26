@@ -44,6 +44,47 @@ _FORECAST_TTL_S = 3 * 3600
 _forecast_cache: Dict[tuple, Tuple[float, Dict[str, List[float]]]] = {}
 _forecast_cache_lock = threading.Lock()
 
+# Circuit breaker for sustained Open-Meteo rate limiting. When the quota is
+# exhausted every request burns the full retry backoff (~15s) AND four more quota
+# hits before giving up — deepening the hole. After enough consecutive persistent
+# rate-limits we trip the breaker and short-circuit fetches for a cooldown, so the
+# scan fails fast and stops hammering. Cached values are still served while open.
+_CB_FAIL_THRESHOLD = 8
+_CB_COOLDOWN_S = 300
+_cb_lock = threading.Lock()
+_cb_consecutive_fails = 0
+_cb_open_until = 0.0
+
+
+def _circuit_is_open() -> bool:
+    with _cb_lock:
+        return time.time() < _cb_open_until
+
+
+def _circuit_record_success() -> None:
+    global _cb_consecutive_fails, _cb_open_until
+    with _cb_lock:
+        _cb_consecutive_fails = 0
+        _cb_open_until = 0.0
+
+
+def _circuit_record_failure() -> None:
+    global _cb_consecutive_fails, _cb_open_until
+    with _cb_lock:
+        _cb_consecutive_fails += 1
+        if _cb_consecutive_fails >= _CB_FAIL_THRESHOLD and _cb_open_until <= time.time():
+            _cb_open_until = time.time() + _CB_COOLDOWN_S
+            logger.warning(
+                f"Open-Meteo circuit breaker OPEN — {_cb_consecutive_fails} consecutive "
+                f"rate-limit failures; pausing fetches {_CB_COOLDOWN_S}s to stop burning quota"
+            )
+
+
+def reset_circuit() -> None:
+    """Force-close the rate-limit circuit breaker (e.g. at the start of a scan)."""
+    _circuit_record_success()
+
+
 # Variance-inflation (under-dispersion correction). Min resolved-error samples
 # before we trust the bias table's dispersion estimate; until then, fall back to
 # a conservative day-ahead temperature spread floor (°F). See _inflate_dispersion.
@@ -356,6 +397,10 @@ def _fetch_ensemble_vars(
         if hit is not None and (now - hit[0]) < _FORECAST_TTL_S:
             return hit[1]
 
+    # Breaker tripped: skip the network entirely (no cached value available).
+    if _circuit_is_open():
+        return None
+
     params = {
         "latitude": lat,
         "longitude": lon,
@@ -378,7 +423,9 @@ def _fetch_ensemble_vars(
                 break
             else:
                 logger.warning(f"Open-Meteo persistently rate-limited [{model}/{variables}]")
+                _circuit_record_failure()
                 return None
+            _circuit_record_success()
             data = resp.json()
 
         daily = data.get("daily", {})

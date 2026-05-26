@@ -169,6 +169,10 @@ def run_scan(
     from src.calibration import reset_cache
     reset_cache()
 
+    # Start each scan with a fresh rate-limit circuit (fail-fast budget resets).
+    from src.forecast import reset_circuit
+    reset_circuit()
+
     min_ev = min_ev if min_ev is not None else settings.min_ev_threshold
     min_confidence = min_confidence if min_confidence is not None else settings.min_confidence
     max_hours = max_hours if max_hours is not None else settings.max_hours_to_resolution
