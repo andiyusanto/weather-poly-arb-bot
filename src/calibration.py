@@ -71,6 +71,21 @@ _curve_cache: Dict[str, Tuple[List[float], List[float]]] = {}
 _skill_cache: Dict[Tuple[str, str], float] = {}
 
 
+def reset_cache() -> None:
+    """
+    Drop the in-memory curve/skill caches so the next lookup re-reads the DB.
+
+    Critical for the long-running ``trade`` process: ``rebuild_calibration`` runs
+    in a *separate* process (the resolve cron), so it can only clear its own
+    cache. Without an explicit reset here, the trader would keep serving whatever
+    curve it cached at startup — typically the warm-up identity curve — and bet on
+    uncalibrated probabilities forever. The scanner calls this once per cycle.
+    """
+    with _cache_lock:
+        _curve_cache.clear()
+        _skill_cache.clear()
+
+
 # ── Inference ─────────────────────────────────────────────────────────────────
 
 def calibrate_probability(raw_prob: float, market_type: str) -> float:
@@ -185,10 +200,8 @@ def rebuild_calibration(n_bins: int = 10) -> Dict[str, int]:
             )
             c.commit()
 
-    # Invalidate caches
-    with _cache_lock:
-        _curve_cache.clear()
-        _skill_cache.clear()
+    # Invalidate caches so this process serves the freshly-fit curve immediately.
+    reset_cache()
 
     return summary
 

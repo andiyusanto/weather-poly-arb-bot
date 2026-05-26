@@ -248,6 +248,23 @@ class TradeStore:
             )
             conn.commit()
 
+    def traded_bucket_keys(self) -> set[tuple]:
+        """
+        Return the set of (city, target_date, bucket_label, side) already traded.
+
+        Used to enforce one bet per bucket across cycles: the trader re-scans
+        every interval, so without this guard the same bucket is re-entered each
+        cycle — inflating the shadow sample and over-concentrating live capital.
+        """
+        with sqlite3.connect(self._db) as conn:
+            rows = conn.execute(
+                "SELECT city, target_date, bucket_label, side FROM trades"
+            ).fetchall()
+        return {
+            ((r[0] or ""), (r[1] or ""), (r[2] or ""), (r[3] or "yes").lower())
+            for r in rows
+        }
+
     def open_shadow_trades(self) -> list[dict]:
         """Shadow trades that have not yet been resolved."""
         with sqlite3.connect(self._db) as conn:

@@ -206,9 +206,21 @@ def run_trading_cycle(
 
     display_opportunities(result)
 
+    # Drop buckets we've already bet (any prior cycle/day). The scan re-discovers
+    # the same buckets every interval; without this we re-enter the same position
+    # each cycle, biasing the shadow sample and over-concentrating live capital.
+    traded = _trade_store.traded_bucket_keys()
+    def _key(opp: Opportunity) -> tuple:
+        td = opp.market.target_date.isoformat() if opp.market.target_date else ""
+        return (opp.market.city or "", td, opp.bucket.outcome_label or "", (opp.side or "yes").lower())
+    fresh = [o for o in result.opportunities if _key(o) not in traded]
+    n_dup = len(result.opportunities) - len(fresh)
+    if n_dup:
+        logger.info(f"Skipped {n_dup} already-traded buckets (one bet per bucket)")
+
     already_spent = _trade_store.today_spent()
     actionable = apply_daily_limit(
-        result.opportunities[:top_n],
+        fresh[:top_n],
         already_spent_today=already_spent,
         daily_max=settings.daily_max_usdc,
     )

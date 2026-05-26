@@ -33,6 +33,23 @@ OPEN_METEO_ENSEMBLE_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
 # cities, we hit the per-IP rate limit (429). Stay conservative.
 _OPEN_METEO_SEM = threading.Semaphore(2)
 
+# TTL cache for raw ensemble fetches keyed by (lat, lon, date, model, variables).
+# The trader re-scans every ~30 min but weather forecasts barely move over a few
+# hours, so without this we re-fetch everything each cycle and exhaust the
+# Open-Meteo daily quota → ~69% of forecasts get dropped to 429s. Same-day
+# targets still get last-minute tightening via the intraday-high path downstream.
+# Only successful (non-None) results are cached, so a transient 429 is retried
+# next cycle rather than suppressing the forecast for hours.
+_FORECAST_TTL_S = 3 * 3600
+_forecast_cache: Dict[tuple, Tuple[float, Dict[str, List[float]]]] = {}
+_forecast_cache_lock = threading.Lock()
+
+# Variance-inflation (under-dispersion correction). Min resolved-error samples
+# before we trust the bias table's dispersion estimate; until then, fall back to
+# a conservative day-ahead temperature spread floor (°F). See _inflate_dispersion.
+MIN_DISPERSION_SAMPLES = 20
+_DEFAULT_DISPERSION_F = 2.0
+
 DEFAULT_MODEL_WEIGHTS: Dict[str, float] = {
     "icon_seamless": 1.0,
     "gfs_seamless": 0.9,
@@ -277,6 +294,27 @@ class BiasStore:
             ).fetchall()
         return float(np.mean([r[0] for r in rows])) if rows else 0.0
 
+    def error_std(self, variable: str = "temperature",
+                  min_samples: int = MIN_DISPERSION_SAMPLES) -> Optional[float]:
+        """
+        Std of realized forecast errors (observed − forecast_mean) for a variable.
+
+        This is the empirical predictive uncertainty of the ensemble *mean* — the
+        floor the forecast spread should not undercut. Deduped by (city, date) so
+        the per-model triplication in bias_recorder doesn't skew the count;
+        duplication wouldn't change the std, but it would inflate the sample count
+        past ``min_samples`` prematurely. Returns None if too few samples.
+        """
+        with sqlite3.connect(self._db) as c:
+            rows = c.execute(
+                "SELECT DISTINCT city, target_date, error FROM bias WHERE variable=?",
+                (variable,),
+            ).fetchall()
+        errs = [r[2] for r in rows if r[2] is not None]
+        if len(errs) < min_samples:
+            return None
+        return float(np.std(errs))
+
 
 _bias_store = BiasStore()
 
@@ -310,6 +348,13 @@ def _fetch_ensemble_vars(
     if days_ahead > _MAX_FORECAST_DAYS:
         logger.debug(f"Skipping {model}/{variables} for {target_date} ({days_ahead}d > {_MAX_FORECAST_DAYS}d horizon)")
         return None
+
+    cache_key = (round(lat, 3), round(lon, 3), str(target_date), model, variables)
+    now = time.time()
+    with _forecast_cache_lock:
+        hit = _forecast_cache.get(cache_key)
+        if hit is not None and (now - hit[0]) < _FORECAST_TTL_S:
+            return hit[1]
 
     params = {
         "latitude": lat,
@@ -348,6 +393,9 @@ def _fetch_ensemble_vars(
                 except (TypeError, ValueError):
                     pass
 
+        if result:
+            with _forecast_cache_lock:
+                _forecast_cache[cache_key] = (now, result)
         return result if result else None
     except Exception as e:
         logger.error(f"Open-Meteo fetch failed [{model}/{variables}] ({lat},{lon}) {target_date}: {e}")
@@ -355,6 +403,28 @@ def _fetch_ensemble_vars(
 
 
 # ── KDE fitting ───────────────────────────────────────────────────────────────
+
+def _inflate_dispersion(members: List[float], target_std: float) -> List[float]:
+    """
+    Scale ensemble members about their mean so the spread is at least ``target_std``.
+
+    Weather ensembles are chronically *under-dispersed*: the spread across members
+    understates the true forecast error. Audit of the bias table showed claimed
+    spread ~1.56°F vs realized error ~2.34°F (mean error ~0), i.e. ~1.5× too
+    confident — the root of the single-degree-bucket overconfidence. We never
+    *narrow* a forecast (factor floored at 1.0); we only widen ones tighter than
+    our demonstrated track record. Mean is preserved (it's already ~unbiased).
+    """
+    if target_std <= 0 or len(members) < 2:
+        return members
+    arr = np.asarray(members, dtype=float)
+    cur = float(arr.std())
+    if cur <= 1e-6 or target_std <= cur:
+        return members
+    mu = float(arr.mean())
+    factor = target_std / cur
+    return (mu + (arr - mu) * factor).tolist()
+
 
 def _fit_kde(samples: List[float]) -> Optional[gaussian_kde]:
     if len(samples) < 5:
@@ -467,6 +537,20 @@ def get_ensemble_forecast(
     if not all_weighted:
         logger.warning(f"No temperature forecast for {city} on {target_date}")
         return None
+
+    # Variance inflation: widen the ensemble to match realized forecast error
+    # before deriving bucket probabilities. Corrects chronic under-dispersion that
+    # otherwise dumps ~90%+ mass onto a single-degree bucket. Floor is fit from the
+    # bias table once enough errors exist, else a conservative default.
+    if use_bias_correction:
+        floor = _bias_store.error_std("temperature") or _DEFAULT_DISPERSION_F
+        pre_std = float(np.std(all_weighted))
+        all_weighted = _inflate_dispersion(all_weighted, floor)
+        post_std = float(np.std(all_weighted))
+        if post_std > pre_std + 1e-6:
+            logger.debug(
+                f"  dispersion inflated {pre_std:.2f}→{post_std:.2f}°F (floor={floor:.2f})"
+            )
 
     # Intraday refresh: when the target date is today and we already have
     # observed high-temp-so-far, the realized high is bounded below by it.

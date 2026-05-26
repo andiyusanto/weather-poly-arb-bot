@@ -162,6 +162,13 @@ def run_scan(
     t0 = time.time()
     _load_priority_cities()
 
+    # The resolve cron rebuilds the calibration curve in a separate process, so
+    # drop our in-memory cache each cycle to pick up the latest curve from the DB.
+    # Without this the long-running trader serves a stale (often warm-up identity)
+    # curve and bets on uncalibrated probabilities. See calibration.reset_cache.
+    from src.calibration import reset_cache
+    reset_cache()
+
     min_ev = min_ev if min_ev is not None else settings.min_ev_threshold
     min_confidence = min_confidence if min_confidence is not None else settings.min_confidence
     max_hours = max_hours if max_hours is not None else settings.max_hours_to_resolution
