@@ -269,13 +269,16 @@ def resolve_shadow(
 
     console.print(f"\n[green]Resolved {len(resolved)} shadow trade(s):[/green]")
     for t in resolved:
-        outcome = t.get("outcome", "?")
+        outcome = (t.get("outcome") or "?")
+        side = (t.get("side") or "yes").lower()
         pnl = t.get("pnl", 0.0)
-        sign = "✅" if outcome == "yes" else "❌"
+        # A win is when the side we BET matches the resolution — not just outcome=yes.
+        won = (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no")
+        sign = "✅" if won else "❌"
         color = "green" if pnl >= 0 else "red"
         console.print(
             f"  {sign} #{t['id']} {t.get('city')} {t.get('bucket_label')} "
-            f"→ {outcome.upper()} | [{color}]P&L ${pnl:.2f}[/{color}]"
+            f"[{side.upper()}] → {outcome.upper()} | [{color}]P&L ${pnl:.2f}[/{color}]"
         )
 
 
