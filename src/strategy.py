@@ -223,6 +223,17 @@ def evaluate_market(
         if side_ev < min_ev:
             continue
 
+        # Confidence floor on the side we're actually betting. EV-only triggering
+        # buys cheap longshots whose tiny probabilities are tail-noise (and where
+        # the model is empirically anti-predictive). Require the bet to be on an
+        # outcome we consider reasonably likely.
+        if side_prob < settings.min_model_prob:
+            logger.debug(
+                f"  [{market.market_type.value}] {bucket.outcome_label} {side.upper()}: "
+                f"prob {side_prob:.2f} < min {settings.min_model_prob:.2f} — skipped"
+            )
+            continue
+
         if side_ev > ev_cap:
             # Suspicious EV — usually means market is near-resolved or priced
             # in a way the model can't actually evaluate. Skip rather than trade.

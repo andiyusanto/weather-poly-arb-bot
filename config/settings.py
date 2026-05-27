@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     max_trade_usdc: float = 50.0
     daily_max_usdc: float = 500.0
     min_confidence: float = 0.55
+    # Minimum probability for the side we bet. EV alone will buy 3¢ longshots on
+    # model_prob a few % above the ask — exactly where the KDE tail is unreliable
+    # and the model is anti-predictive (resolved data: every winner had side
+    # prob >=0.76, every loser <=0.57). Only bet outcomes we think are likely.
+    min_model_prob: float = 0.55
     # Open-Meteo ensemble horizon is 16 days. Cap at 15d so every market we
     # surface has at least one valid forecast member.
     max_hours_to_resolution: float = 360.0
