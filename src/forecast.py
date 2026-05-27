@@ -579,7 +579,7 @@ def get_ensemble_forecast(
         repeats = max(1, round(w * 10))
         all_weighted.extend(corrected_f * repeats)
 
-        logger.debug(f"  temp/{model}: {len(raw_c)} members, mean={mean_f:.1f}°F, std={std_f:.1f}°F, bias={bias:+.1f}°F")
+        logger.debug(f"  [{city}] temp/{model}: {len(raw_c)} members, mean={mean_f:.1f}°F, std={std_f:.1f}°F, bias={bias:+.1f}°F")
 
     if not all_weighted:
         logger.warning(f"No temperature forecast for {city} on {target_date}")
@@ -596,7 +596,7 @@ def get_ensemble_forecast(
         post_std = float(np.std(all_weighted))
         if post_std > pre_std + 1e-6:
             logger.debug(
-                f"  dispersion inflated {pre_std:.2f}→{post_std:.2f}°F (floor={floor:.2f})"
+                f"  [{city}] dispersion inflated {pre_std:.2f}→{post_std:.2f}°F (floor={floor:.2f})"
             )
 
     # Intraday refresh: when the target date is today and we already have

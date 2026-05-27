@@ -272,7 +272,12 @@ def _fit_isotonic(
         if not chunk:
             continue
         edges.append(float(chunk[-1][0]))
-        rates.append(float(sum(w for _, w in chunk) / len(chunk)))
+        # Laplace (additive) smoothing: (wins + 1) / (n + 2). With ~3 samples per
+        # bin a raw proportion yields hard 0.0/1.0 — and a calibrated prob of 1.0
+        # makes Kelly treat an ~85%-true outcome as certain and size to the cap.
+        # Smoothing shrinks extremes toward 0.5 and auto-relaxes as n grows.
+        wins = sum(w for _, w in chunk)
+        rates.append((wins + 1.0) / (len(chunk) + 2.0))
 
     # Pool-adjacent-violators to enforce monotonicity
     i = 0
