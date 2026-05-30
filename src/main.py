@@ -296,5 +296,120 @@ def shadow_pnl() -> None:
     shadow_performance_report()
 
 
+@app.command()
+def side_pnl(
+    side: str = typer.Option("both", "--side", help="'yes', 'no', or 'both' (default)."),
+    since_id: int = typer.Option(
+        130, "--since", help="Only include trades with id > this. Default 130 = post-gate."
+    ),
+    all_history: bool = typer.Option(
+        False, "--all", help="Include ALL trades (overrides --since)."
+    ),
+) -> None:
+    """
+    Per-side win rate, P&L, and edge-vs-breakeven for resolved shadow trades.
+
+    Default scope is post-gate trades (id > 130). Use --all for the full history
+    or --since N to choose a different cutoff. Shows the decisive metric: whether
+    the 95% CI lower bound on win rate clears the avg ask price (= break-even).
+    """
+    setup_logging()
+    _banner()
+
+    import sqlite3
+    import math
+    from rich.table import Table
+    from config.settings import TRADES_DB
+
+    side = side.lower().strip()
+    if side not in ("yes", "no", "both"):
+        console.print("[red]--side must be 'yes', 'no', or 'both'[/red]")
+        raise typer.Exit(code=1)
+
+    where = "outcome IS NOT NULL"
+    if not all_history:
+        where += f" AND id > {int(since_id)}"
+    sides = ("yes", "no") if side == "both" else (side,)
+
+    def _row(s: str) -> dict:
+        with sqlite3.connect(TRADES_DB) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                f"SELECT outcome, market_price, pnl, size_usdc "
+                f"FROM trades WHERE {where} AND side = ?",
+                (s,),
+            ).fetchall()
+            pending = conn.execute(
+                f"SELECT COUNT(*) FROM trades WHERE outcome IS NULL "
+                f"{'AND id > ' + str(int(since_id)) if not all_history else ''} "
+                f"AND side = ?",
+                (s,),
+            ).fetchone()[0]
+        n = len(rows)
+        if n == 0:
+            return dict(side=s, n=0, pending=pending)
+        won = sum(1 for r in rows if r["outcome"] == s)
+        pnl = sum(r["pnl"] or 0 for r in rows)
+        size = sum(r["size_usdc"] or 0 for r in rows)
+        avg_ask = sum(r["market_price"] for r in rows) / n
+        p = won / n
+        se = math.sqrt(p * (1 - p) / n) if n > 1 else 0.0
+        return dict(
+            side=s, n=n, pending=pending, won=won, win_rate=p,
+            ci_lo=max(0.0, p - 1.96 * se), ci_hi=min(1.0, p + 1.96 * se),
+            avg_ask=avg_ask, gap=p - avg_ask,
+            pnl=pnl, size=size, roi=pnl / size if size else 0.0,
+        )
+
+    scope = "ALL trades" if all_history else f"trades with id > {since_id} (post-gate)"
+    console.print(f"\n[bold cyan]Per-side performance — {scope}[/bold cyan]\n")
+
+    table = Table(header_style="bold magenta", border_style="dim")
+    table.add_column("metric", no_wrap=True)
+    if "yes" in sides:
+        table.add_column("YES", justify="right")
+    if "no" in sides:
+        table.add_column("NO", justify="right")
+
+    results = {s: _row(s) for s in sides}
+
+    def cell(s: str, fmt) -> str:
+        d = results[s]
+        if d["n"] == 0:
+            return "—"
+        return fmt(d)
+
+    def add(label: str, fmt) -> None:
+        cells = [cell(s, fmt) for s in sides]
+        table.add_row(label, *cells)
+
+    add("resolved", lambda d: f"{d['n']}")
+    add("pending",  lambda d: f"{d['pending']}")
+    add("wins",     lambda d: f"{d['won']}")
+    add("win rate", lambda d: f"{d['win_rate']:.1%}")
+    add("  95% CI", lambda d: f"[{d['ci_lo']:.1%}, {d['ci_hi']:.1%}]")
+    add("avg ask (break-even)", lambda d: f"{d['avg_ask']:.3f}")
+    add("win vs break-even", lambda d: f"{d['gap']:+.1%}")
+    add("cumulative P&L", lambda d: f"${d['pnl']:+,.2f}")
+    add("deployed", lambda d: f"${d['size']:,.0f}")
+    add("ROI", lambda d: f"{d['roi']:+.1%}")
+
+    console.print(table)
+
+    # Decisive interpretation line per side.
+    for s in sides:
+        d = results[s]
+        if d["n"] == 0:
+            console.print(f"  [{s.upper()}] no resolved trades in scope.")
+            continue
+        verdict = (
+            "[green]edge confirmed at 95%[/green]" if d["ci_lo"] > d["avg_ask"]
+            else "[red]no edge — CI lower bound below break-even[/red]" if d["ci_hi"] < d["avg_ask"]
+            else "[yellow]inconclusive — break-even sits inside CI[/yellow]"
+        )
+        console.print(f"  [{s.upper()}] n={d['n']}: {verdict}")
+    console.print()
+
+
 if __name__ == "__main__":
     app()
