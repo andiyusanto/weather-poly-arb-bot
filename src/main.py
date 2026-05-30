@@ -411,5 +411,322 @@ def side_pnl(
     console.print()
 
 
+@app.command()
+def slice_dash(
+    side: str = typer.Option("yes", "--side", help="'yes' (default) or 'no'."),
+    since_id: int = typer.Option(
+        130, "--since", help="Only include trades with id > this. Default 130 = post-gate."
+    ),
+    all_history: bool = typer.Option(
+        False, "--all", help="Include ALL trades (overrides --since)."
+    ),
+) -> None:
+    """
+    Slice resolved shadow trades by ask range, bucket type, city, lead time, and
+    model_prob band — to find which patterns actually carry the edge. Read-only:
+    does NOT affect trading. Run anytime; useful for spotting where edge lives
+    in your post-gate sample without running CI math in your head.
+    """
+    setup_logging()
+    _banner()
+
+    import sqlite3
+    import math
+    from rich.table import Table
+    from config.settings import TRADES_DB
+
+    side = side.lower().strip()
+    if side not in ("yes", "no"):
+        console.print("[red]--side must be 'yes' or 'no'[/red]")
+        raise typer.Exit(code=1)
+
+    where = "outcome IS NOT NULL AND side = ?"
+    if not all_history:
+        where += f" AND id > {int(since_id)}"
+
+    with sqlite3.connect(TRADES_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT id, city, bucket_label, target_date, model_prob, market_price, "
+            f"size_usdc, outcome, pnl, timestamp "
+            f"FROM trades WHERE {where} ORDER BY id",
+            (side,),
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+
+    if not rows:
+        console.print(f"[yellow]No resolved {side.upper()} trades in scope.[/yellow]")
+        return
+
+    def _ask_bucket(p: float) -> str:
+        if p < 0.20: return "A: <0.20 deep-longshot"
+        if p < 0.40: return "B: 0.20-0.40 longshot"
+        if p < 0.60: return "C: 0.40-0.60 middle"
+        return "D: >=0.60 favorite"
+
+    def _bucket_kind(label: str) -> str:
+        l = (label or "").lower()
+        if "higher" in l or "below" in l or "or more" in l or "or less" in l:
+            return "open-ended"
+        if "between" in l or "-" in l:
+            return "range"
+        return "single-degree"
+
+    def _model_bin(p: float) -> str:
+        if p < 0.60: return "0.55-0.60"
+        if p < 0.70: return "0.60-0.70"
+        if p < 0.80: return "0.70-0.80"
+        if p < 0.90: return "0.80-0.90"
+        return "0.90-1.00"
+
+    def _lead_bucket(target: str, ts: str) -> str:
+        try:
+            from datetime import datetime
+            t = datetime.fromisoformat(target)
+            placed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            hrs = (t - placed.replace(tzinfo=None)).total_seconds() / 3600
+            if hrs < 12: return "<12h"
+            if hrs < 24: return "12-24h"
+            if hrs < 36: return "24-36h"
+            return "36-48h"
+        except Exception:
+            return "?"
+
+    def _aggregate(rows: list, key_fn) -> list[dict]:
+        from collections import defaultdict
+        agg = defaultdict(lambda: dict(n=0, won=0, pnl=0.0, size=0.0, ask=0.0))
+        for r in rows:
+            k = key_fn(r)
+            a = agg[k]
+            a["n"] += 1
+            a["won"] += 1 if r["outcome"] == side else 0
+            a["pnl"] += r["pnl"] or 0
+            a["size"] += r["size_usdc"] or 0
+            a["ask"] += r["market_price"]
+        out = []
+        for k, a in agg.items():
+            n = a["n"]
+            avg_ask = a["ask"] / n
+            wr = a["won"] / n
+            se = math.sqrt(wr * (1 - wr) / n) if n > 1 else 0
+            out.append(dict(
+                key=k, n=n, won=a["won"], wr=wr,
+                ci_lo=max(0, wr - 1.96 * se), ci_hi=min(1, wr + 1.96 * se),
+                pnl=a["pnl"], size=a["size"],
+                roi=a["pnl"] / a["size"] if a["size"] else 0,
+                avg_ask=avg_ask, gap=wr - avg_ask,
+            ))
+        return out
+
+    def _render(title: str, agg: list[dict], sort_key: str = "key") -> None:
+        agg = sorted(agg, key=lambda d: d[sort_key])
+        t = Table(title=title, header_style="bold magenta", border_style="dim")
+        for col in ("slice", "n", "won", "win%", "avg ask", "gap", "P&L", "ROI"):
+            t.add_column(col, no_wrap=True)
+        for d in agg:
+            gap_color = "green" if d["gap"] > 0 else "red"
+            roi_color = "green" if d["roi"] >= 0 else "red"
+            t.add_row(
+                str(d["key"]),
+                str(d["n"]),
+                str(d["won"]),
+                f"{d['wr']:.0%}",
+                f"{d['avg_ask']:.3f}",
+                f"[{gap_color}]{d['gap']:+.1%}[/{gap_color}]",
+                f"${d['pnl']:+,.0f}",
+                f"[{roi_color}]{d['roi']:+.1%}[/{roi_color}]",
+            )
+        console.print(t)
+
+    scope = "ALL trades" if all_history else f"id > {since_id} (post-gate)"
+    console.print(f"\n[bold cyan]Slice dashboard — {side.upper()} side — {scope}  (n={len(rows)})[/bold cyan]\n")
+
+    _render("By ask range", _aggregate(rows, lambda r: _ask_bucket(r["market_price"])))
+    _render("By bucket type", _aggregate(rows, lambda r: _bucket_kind(r["bucket_label"])))
+    _render("By model_prob band", _aggregate(rows, lambda r: _model_bin(r["model_prob"])))
+    _render("By lead time", _aggregate(rows, lambda r: _lead_bucket(r["target_date"] or "", r["timestamp"] or "")))
+    by_city = _aggregate(rows, lambda r: r["city"] or "?")
+    _render("By city (top profit)", sorted(by_city, key=lambda d: -d["pnl"])[:8], "pnl")
+    _render("By city (bottom)", sorted(by_city, key=lambda d: d["pnl"])[:5], "pnl")
+
+    # Two-way: ask range × bucket type — where edge concentrates.
+    twoway = _aggregate(rows, lambda r: f"{_ask_bucket(r['market_price']).split(':')[0]} × {_bucket_kind(r['bucket_label'])}")
+    _render("By ask × bucket-type (where edge concentrates)", sorted(twoway, key=lambda d: -d["pnl"]))
+
+    console.print(
+        "[dim]Reading guide: green 'gap' = won more than break-even; large green ROI on a "
+        "slice with n>=10 is a candidate edge pattern. Treat n<5 slices as anecdote.[/dim]\n"
+    )
+
+
+@app.command()
+def yes_score(
+    since_id: int = typer.Option(
+        130, "--since", help="Train on YES trades with id > this. Default 130 = post-gate."
+    ),
+    all_history: bool = typer.Option(
+        False, "--all", help="Train on ALL YES history."
+    ),
+) -> None:
+    """
+    Prototype YES-quality score — does NOT deploy or affect trading.
+
+    Computes per-feature win-rate lift over the base rate (which features predict
+    a YES win?), fits a transparent additive log-odds score on top features, and
+    reports leave-one-out cross-validated accuracy so you can judge how much of
+    the apparent edge is real vs. overfit to the small sample.
+    """
+    setup_logging()
+    _banner()
+
+    import sqlite3
+    import math
+    from rich.table import Table
+    from config.settings import TRADES_DB
+
+    where = "outcome IS NOT NULL AND side = 'yes'"
+    if not all_history:
+        where += f" AND id > {int(since_id)}"
+
+    with sqlite3.connect(TRADES_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"SELECT id, city, bucket_label, target_date, model_prob, market_price, "
+            f"outcome, pnl, size_usdc, timestamp "
+            f"FROM trades WHERE {where} ORDER BY id"
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+
+    n = len(rows)
+    if n < 5:
+        console.print(f"[yellow]Only {n} YES trades available — need ~5+ for any score. Wait.[/yellow]")
+        return
+
+    base_rate = sum(1 for r in rows if r["outcome"] == "yes") / n
+
+    # Feature extractors (categorical, all available at trade time).
+    def _ask_bucket(p: float) -> str:
+        if p < 0.20: return "deep_longshot"
+        if p < 0.40: return "longshot"
+        if p < 0.60: return "middle"
+        return "favorite"
+
+    def _bucket_kind(label: str) -> str:
+        l = (label or "").lower()
+        if "higher" in l or "below" in l: return "open_ended"
+        if "between" in l: return "range"
+        return "single_degree"
+
+    def _model_bin(p: float) -> str:
+        if p < 0.65: return "low"
+        if p < 0.80: return "mid"
+        return "high"
+
+    features = {
+        "ask_range": lambda r: _ask_bucket(r["market_price"]),
+        "bucket_type": lambda r: _bucket_kind(r["bucket_label"]),
+        "model_prob": lambda r: _model_bin(r["model_prob"]),
+    }
+
+    # Per-feature-value lift table.
+    console.print(f"\n[bold cyan]YES Quality Score — prototype[/bold cyan]")
+    console.print(f"  training sample: n={n}  base win rate: {base_rate:.1%}\n")
+
+    from collections import defaultdict
+
+    log_odds: dict[tuple, float] = {}  # (feature_name, value) -> log-odds vs base
+    for fname, fn in features.items():
+        cnt = defaultdict(lambda: [0, 0])
+        for r in rows:
+            v = fn(r)
+            won = 1 if r["outcome"] == "yes" else 0
+            cnt[v][0] += won
+            cnt[v][1] += 1
+
+        t = Table(
+            title=f"Feature: {fname}",
+            header_style="bold magenta", border_style="dim",
+        )
+        for col in ("value", "n", "win%", "lift", "log-odds"):
+            t.add_column(col, no_wrap=True)
+        for v, (w, k) in sorted(cnt.items(), key=lambda x: -x[1][0] / x[1][1] if x[1][1] else 0):
+            wr = (w + 1) / (k + 2)  # Laplace-smoothed to avoid 0/1 with tiny bins
+            lift = wr - base_rate
+            # log-odds ratio vs base
+            eps = 1e-6
+            lo = math.log(max(eps, wr / (1 - wr + eps)) / max(eps, base_rate / (1 - base_rate + eps)))
+            log_odds[(fname, v)] = lo
+            color = "green" if lift > 0 else "red"
+            t.add_row(
+                v, f"{k}", f"{w/k:.0%}",
+                f"[{color}]{lift:+.1%}[/{color}]",
+                f"{lo:+.2f}",
+            )
+        console.print(t)
+
+    # Build a per-trade score by summing log-odds across features.
+    def _score(r: dict) -> float:
+        return sum(log_odds.get((fname, fn(r)), 0.0) for fname, fn in features.items())
+
+    scored = sorted(rows, key=_score, reverse=True)
+    half = max(1, len(scored) // 2)
+    top, bot = scored[:half], scored[half:]
+
+    def _stats(group: list[dict]) -> dict:
+        if not group: return {}
+        n = len(group)
+        won = sum(1 for r in group if r["outcome"] == "yes")
+        pnl = sum(r["pnl"] or 0 for r in group)
+        size = sum(r["size_usdc"] or 0 for r in group)
+        return dict(n=n, won=won, wr=won/n, pnl=pnl, roi=pnl/size if size else 0)
+
+    s_top, s_bot = _stats(top), _stats(bot)
+    console.print(f"[bold]Score split (in-sample, will be optimistic)[/bold]")
+    console.print(f"  top half  : n={s_top['n']:<3} win {s_top['wr']:.0%}  P&L ${s_top['pnl']:+,.2f}  ROI {s_top['roi']:+.1%}")
+    console.print(f"  bottom    : n={s_bot['n']:<3} win {s_bot['wr']:.0%}  P&L ${s_bot['pnl']:+,.2f}  ROI {s_bot['roi']:+.1%}")
+    console.print()
+
+    # Leave-one-out cross-validation — honest accuracy estimate.
+    correct = 0
+    loo_top_won, loo_top_n = 0, 0
+    for i in range(n):
+        train = rows[:i] + rows[i+1:]
+        # Refit log-odds on train.
+        loo_logodds: dict[tuple, float] = {}
+        base = sum(1 for r in train if r["outcome"] == "yes") / len(train)
+        for fname, fn in features.items():
+            cnt = defaultdict(lambda: [0, 0])
+            for r in train:
+                v = fn(r); won = 1 if r["outcome"] == "yes" else 0
+                cnt[v][0] += won; cnt[v][1] += 1
+            for v, (w, k) in cnt.items():
+                wr = (w + 1) / (k + 2)
+                eps = 1e-6
+                loo_logodds[(fname, v)] = math.log(
+                    max(eps, wr / (1 - wr + eps)) / max(eps, base / (1 - base + eps))
+                )
+        # Score held-out
+        test = rows[i]
+        score = sum(loo_logodds.get((fn_n, fn(test)), 0.0) for fn_n, fn in features.items())
+        predict_win = 1 if score > 0 else 0
+        actual = 1 if test["outcome"] == "yes" else 0
+        if predict_win == actual:
+            correct += 1
+        if score > 0:
+            loo_top_n += 1
+            if actual: loo_top_won += 1
+
+    console.print(f"[bold]Leave-one-out CV (honest)[/bold]")
+    console.print(f"  classification accuracy : {correct/n:.0%}  (base rate would be ~{max(base_rate, 1-base_rate):.0%})")
+    if loo_top_n:
+        console.print(f"  score>0 cohort          : n={loo_top_n}/{n}  win {loo_top_won/loo_top_n:.0%}")
+    console.print()
+    console.print(
+        "[dim]Caveat: with n=20-30 the LOO estimate is itself noisy. Treat as 'is the "
+        "direction promising', not 'is the score deploy-ready'. Re-run after each new "
+        "10-20 YES resolves to see if accuracy stabilises above the base rate.[/dim]\n"
+    )
+
+
 if __name__ == "__main__":
     app()

@@ -554,6 +554,59 @@ journalctl -u polymarket-resolve.service -n 50   # last run output
 - Total P&L positive
 - No single city driving all the edge (diversification check)
 
+#### `python run.py side-pnl` — per-side performance & CI verdict
+
+`shadow-pnl` aggregates everything. `side-pnl` splits **YES vs NO**, computes the 95% CI on each side's win rate, and tells you at a glance whether the CI lower bound clears the avg ask (i.e. break-even). This is the decisive metric — most casual eyeballing of "win rate vs break-even" is wrong because it ignores sample-size uncertainty.
+
+```bash
+python run.py side-pnl                  # both sides, post-gate (id > 130) by default
+python run.py side-pnl --side yes       # YES only
+python run.py side-pnl --side no        # NO only
+python run.py side-pnl --all            # include pre-gate history
+python run.py side-pnl --since 200      # custom cutoff
+```
+
+The verdict line per side reads:
+- 🟢 **edge confirmed at 95%** — CI lower bound clears avg ask. Real, measured edge.
+- 🔴 **no edge** — CI upper bound below avg ask. Confidently losing.
+- 🟡 **inconclusive** — break-even sits inside the CI. Keep collecting.
+
+Use this instead of staring at the raw `shadow-pnl` win-rate number — it tells you *how confident* the win-rate estimate is, which matters more than the number itself when n is small.
+
+#### `python run.py slice-dash` — find where edge actually lives
+
+Aggregate numbers hide where the edge is. `slice-dash` cuts your resolved trades by **ask range, bucket type, model-prob band, lead time, and city**, plus a 2-D `ask × bucket-type` view. Read-only — does not affect trading.
+
+```bash
+python run.py slice-dash                # YES side, post-gate (default)
+python run.py slice-dash --side no      # NO side
+python run.py slice-dash --all          # full history
+python run.py slice-dash --since 250    # custom cutoff
+```
+
+Each row shows `n`, win rate, **gap vs break-even** (green=+, red=−), P&L, ROI. Reading guide:
+- **n < 5** → anecdote, ignore
+- **n ≥ 10 with green gap** → candidate edge pattern, worth deeper look
+- **Green gap + n ≥ 30** → strong signal in this slice
+
+Useful for spotting *behavioural mispricing* — e.g. whether edge concentrates in cheap-longshot YES bets ("the market under-prices outcomes nobody bets *for*") or in a specific city or bucket shape.
+
+#### `python run.py yes-score` — quality-score prototype (analysis only)
+
+Trains a transparent additive log-odds score on existing YES trades — per-feature lift table, in-sample top/bottom split, and **leave-one-out cross-validated accuracy** (honest, not in-sample). **Does NOT deploy** — pure analysis tool so you can see whether the score has predictive power *before* wiring it into the strategy.
+
+```bash
+python run.py yes-score                 # train on post-gate YES history
+python run.py yes-score --all           # train on full YES history
+```
+
+Reading the LOO accuracy row:
+- **At base rate (~50%)** → features have no predictive power, score is noise
+- **5–10pp above base** → suggestive, keep collecting data
+- **15pp+ above base, stable across 2–3 reruns** → real signal, candidate for deployment
+
+Re-run every ~20 new YES resolves. When LOO accuracy stabilises meaningfully above base rate, the score is ready to wire into the strategy as a YES-side filter — a separate, post-validation decision.
+
 ### Backtest with per-type breakdown
 
 ```bash
@@ -795,6 +848,124 @@ temperature_2m_max  precipitation_sum  snowfall_sum  wind_speed_10m_max
 ```
 
 The `all_bucket_probabilities()` method is implemented on all four forecast types, making `strategy.py` completely type-agnostic — adding a 5th market type requires only a new forecast class + bucket parser.
+
+---
+
+## Analytics & Edge Validation
+
+This bot is built around the principle that **measurement comes before optimization**. The path from "scan shows +100% EV everywhere" to "real, measured edge" runs through a strict validation discipline. The analytics commands above (`side-pnl`, `slice-dash`, `yes-score`) and the patterns below are the framework.
+
+### The reliability of self-reported EV
+
+Raw EV from the scanner is meaningless until calibration data exists. A freshly-deployed bot will *always* show inflated EVs because:
+
+- The ensemble KDE is chronically under-dispersed (~1.5× too narrow vs. realized error)
+- Without resolved trades the calibration curve is identity passthrough
+- Stored model probabilities therefore equal raw KDE probabilities — already 2× overconfident
+
+The corrections needed (variance inflation in `forecast.py`, Laplace-smoothed empirical calibration in `calibration.py`, the `min_model_prob` gate in `strategy.py`) only engage once shadow data accumulates. **Treat EV from the first ~30 resolved trades as cosmetic, not real.** After that the curve has enough data to meaningfully deflate overconfident picks.
+
+### The binary-options payoff asymmetry (read this before sizing)
+
+A bet of $S at ask price `p` has structural asymmetry:
+
+```
+On win   :  profit = $S × (1/p − 1)        (bounded; smaller when p is larger)
+On loss  :  loss   = −$S                   (whole stake, always)
+Break-even win rate = p exactly
+```
+
+Implications:
+
+- Buying NO at ask 0.65 → risk $50 to win ~$27. Need 65%+ win rate just to break even. Hard.
+- Buying YES at ask 0.30 → risk $50 to win ~$117. Need 30% win rate to break even. Easier and bigger payouts on hits.
+
+**Edge in prediction markets tends to live where price is asymmetric in your favour.** Cheap-longshot YES bets win less often *but pay more when they hit* — exactly the behavioural mispricing zone where retail flow doesn't bet.
+
+### The market-efficiency check
+
+When your calibrated model probability ≈ the market's ask price for a given pattern, **the market already knows what you know**. Polymarket weather markets are watched by people running the same publicly available models (ECMWF, GFS, ICON via Open-Meteo). Once your bot is correctly calibrated, the NO-side of confident bets tends to collapse to that fair-priced regime: win rate ≈ ask, ROI ≈ 0%.
+
+That's not a failure — it's *correctness*. It tells you to look elsewhere for edge:
+1. **Better data** (paid weather feed, station-level observations vs. gridded model output)
+2. **Better processing** (regional high-res models — HRRR for US, AROME/ICON-D2 for Europe, JMA-MSM for Japan — typically beat the public global stack)
+3. **Behavioural mispricing** (where retail flow systematically misprices)
+4. **Speed/access** (faster reaction to news than the market)
+
+For this codebase, #3 is the most empirically supported path: YES longshots in `ask 0.20–0.40` and open-ended buckets ("X°F or higher") show consistent positive lift over break-even.
+
+### Validation workflow — the gauntlet a strategy must pass
+
+Run these checks in order. Any single failure is reason to *not* go live.
+
+**1. Mechanism validation (does the plumbing work?)** — verify with logs and the analytics commands:
+- Bias correction values non-zero per city
+- Variance inflation firing (`dispersion inflated X→Y°F` debug lines)
+- Calibration curve has ≥ 30 samples and uses Laplace smoothing (no hard 0.0 or 1.0 bin)
+- No persistent Open-Meteo rate limiting
+- Per-bucket dedup in effect (no duplicate `(city, target_date, bucket_label, side)`)
+
+**2. Aggregate-statistical validation** — `side-pnl`:
+- 95% CI lower bound on win rate clears the avg ask paid
+- ROI positive at n ≥ 100 (per side)
+- Cohort trajectory (split sample into thirds) shows the recent cohort isn't worst
+
+**3. Concentration check** — `slice-dash` and manual:
+- No single city > 40% of total P&L
+- Top-3 trades (by P&L) < 60% of total profit
+- Edge holds in the largest sub-slice (n ≥ 30) of `ask × bucket-type`
+
+**4. Out-of-sample stability** — `yes-score` (or hand-coded equivalent):
+- Leave-one-out classification accuracy ≥ 15pp above base rate
+- LOO accuracy stable across 2–3 consecutive reruns spanning ≥ 20 new resolves each
+- Score's top-half-vs-bottom-half ROI gap holds in LOO, not just in-sample
+
+If all four levels pass at n ≥ 100 (per side), you have a defensible edge. Anything less is "suggestive, keep shadowing."
+
+### Reading the cohort trajectory honestly
+
+Splitting the resolved sample into chronological cohorts is the single most informative view:
+
+```
+cohort 1 (earliest)  →  immature calibration, may show negative ROI even on real edge
+cohort 2             →  calibration warming up
+cohort 3 (mature)    →  the trajectory you can trust
+```
+
+Aggregate P&L on a fresh deployment is *always* dragged by the early-cohort warm-up bleed. The signal to act on is the **most recent cohort's** behaviour, not the all-time aggregate. The `slice-dash` chronological cohort split surfaces this directly.
+
+⚠️ **Cohort-4 peak is variance, not the new normal.** If one cohort prints 70%+ win rate, expect regression to mean in the next. Don't size up off the peak — confirm via *sustained* performance across multiple cohorts.
+
+### Fat-tail discipline for longshot strategies
+
+Strategies that rely on cheap-longshot YES bets are inherently fat-tailed: most bets lose, a few pay 4×+ stake. Properties to expect:
+
+- **Variance is large.** ROI in any 30-trade window may swing ±20pp from the true edge.
+- **Top 3 wins may carry > 50% of total P&L.** Not pathological — it's the *shape* of the strategy.
+- **Judge by 50-trade rolling cohorts, not by week-by-week or day-by-day.** Short windows will whip you around emotionally.
+- **Drawdowns are normal even with real edge.** A losing 20-trade window is consistent with a +15% true ROI strategy.
+
+### Common ways validation fails — and what they mean
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| Aggregate P&L stays negative as n grows past 100 | No real edge at current config; market efficient on what you're betting | Reconsider strategy: which side, which patterns, model upgrades |
+| Recent cohort regresses to break-even after a strong cohort | Earlier peak was variance | Keep collecting, don't size up |
+| Edge concentrated in one city or one bucket type | May be real local mispricing OR overfit | Stress-test: does it hold for that city alone across n ≥ 30? |
+| Win rate ≈ avg ask perfectly | Calibration is correct AND market is efficient | "Market knows what you know" — find a different edge source |
+| One side massively positive, other negative | Strong asymmetric edge | Drop the losing side; isolate the experiment on the winning side |
+| LOO accuracy stuck at base rate | Features have no predictive power | Engineer better features OR accept no exploitable pattern |
+
+### The discipline of waiting
+
+The validation workflow can take 10–15 days of shadowing per ~100-trade chunk per side. During that wait:
+
+- **Build analytics tools** (the commands above are examples) — no contamination
+- **Audit losses for patterns** — note findings, do not act on them
+- **Resist all config changes** — every change resets the validation clock and forces you to discard your sample
+- **Do not reset `trades.db`** — the calibration curve currently fit on N samples is an asset; throwing it away costs you days
+
+The single most common failure mode of this kind of bot is **changing strategy mid-shadow because of psychological discomfort with a temporary drawdown.** The cohort split tells you whether the drawdown is the early-cohort drag (acceptable) or a real regression (signal). Trust the metric, not the gut.
 
 ---
 
