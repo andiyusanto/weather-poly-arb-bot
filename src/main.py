@@ -553,6 +553,18 @@ def slice_dash(
     twoway = _aggregate(rows, lambda r: f"{_ask_bucket(r['market_price']).split(':')[0]} × {_bucket_kind(r['bucket_label'])}")
     _render("By ask × bucket-type (where edge concentrates)", sorted(twoway, key=lambda d: -d["pnl"]))
 
+    # Two-way: model_prob band × bucket type — isolates whether the mid-band
+    # overconfidence bleed is concentrated in a single bucket shape (likely
+    # open-ended tail mass) or spread across types (= a calibration-only issue).
+    twoway2 = _aggregate(
+        rows,
+        lambda r: f"{_model_bin(r['model_prob'])} × {_bucket_kind(r['bucket_label'])}",
+    )
+    _render(
+        "By model_prob × bucket-type (calibration pocket vs tail-mass)",
+        sorted(twoway2, key=lambda d: -d["pnl"]),
+    )
+
     console.print(
         "[dim]Reading guide: green 'gap' = won more than break-even; large green ROI on a "
         "slice with n>=10 is a candidate edge pattern. Treat n<5 slices as anecdote.[/dim]\n"
