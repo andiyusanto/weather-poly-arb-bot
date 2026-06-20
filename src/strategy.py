@@ -42,6 +42,9 @@ class Opportunity:
     hours_to_resolution: Optional[float] = None
     # The token that will actually be purchased (yes or no token, depending on side).
     trade_token_id: str = ""
+    # True if this NO bet was flipped from YES by the contrarian-inversion flag
+    # (Option F). Lets analytics distinguish inverted trades from natural NO picks.
+    contrarian: bool = False
 
     @property
     def edge_pct(self) -> str:
@@ -250,12 +253,14 @@ def evaluate_market(
         # which buckets) is unchanged — only the SIDE flips. No re-gating on
         # min_ev or min_model_prob: the inversion is a strategic mirror, not a
         # fresh evaluation. NO-side originals pass through untouched.
+        inverted = False
         if settings.contrarian_yes_inversion and side == "yes":
             side = "no"
             side_prob = p_no
             side_ask = ask_no
             side_ev = ev_no if ev_no > -1.0 else compute_ev(p_no, ask_no)
             trade_token = bucket.no_token_id or bucket.token_id
+            inverted = True
             logger.info(
                 f"  CONTRARIAN: YES→NO on {bucket.outcome_label} "
                 f"(yes_prob={p_yes:.2f} ask_yes={ask_yes:.3f} → "
@@ -278,6 +283,7 @@ def evaluate_market(
             side=side,
             trade_token_id=trade_token,
             hours_to_resolution=hours_left,
+            contrarian=inverted,
         ))
 
     if not candidate_opps:

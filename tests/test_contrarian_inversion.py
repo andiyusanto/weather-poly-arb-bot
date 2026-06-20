@@ -61,6 +61,7 @@ def test_yes_pick_inverts_to_no_when_flag_set() -> None:
         assert abs(opps[0].model_prob - 0.20) < 1e-9  # 1 − 0.80
         assert opps[0].market_price == 0.45
         assert opps[0].trade_token_id == "no-tok"
+        assert opps[0].contrarian is True  # marker propagates for analytics
 
 
 def test_no_pick_unaffected_by_flag() -> None:
@@ -73,6 +74,7 @@ def test_no_pick_unaffected_by_flag() -> None:
         assert len(opps) == 1 and opps[0].side == "no"
         assert opps[0].market_price == 0.50
         assert opps[0].trade_token_id == "no-tok"
+        assert opps[0].contrarian is False  # natural NO — not flipped
 
 
 def test_gates_still_apply_before_inversion() -> None:

@@ -165,6 +165,7 @@ def execute_opportunity(
         forecast_mean=forecast_mean,
         dry_run=int((dry_run or settings.dry_run) and not shadow),
         shadow=int(shadow),
+        contrarian=int(getattr(opp, "contrarian", False)),
     )
     _trade_store.record(trade_record)
 

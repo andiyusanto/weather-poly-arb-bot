@@ -193,6 +193,7 @@ class TradeStore:
             ("target_date",   "TEXT"),
             ("forecast_mean", "REAL"),     # mean of forecast variable at trade time
             ("condition_id",  "TEXT"),     # Polymarket conditionId for resolution lookup
+            ("contrarian",    "INTEGER DEFAULT 0"),  # 1 if side was flipped from YES→NO by Option F
         ]:
             if col not in existing:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
@@ -207,6 +208,7 @@ class TradeStore:
         trade.setdefault("target_date", "")
         trade.setdefault("forecast_mean", None)
         trade.setdefault("condition_id", "")
+        trade.setdefault("contrarian", 0)
         with sqlite3.connect(self._db) as conn:
             conn.execute(
                 """
