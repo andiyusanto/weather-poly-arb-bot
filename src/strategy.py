@@ -243,6 +243,25 @@ def evaluate_market(
             )
             continue
 
+        # ── Contrarian YES inversion (Option F) ─────────────────────────────
+        # The model's YES picks have a stable structural overconfidence bias.
+        # When this flag is set, every market that EV-passes for YES is bought
+        # as NO on the same bucket instead. The decision logic (which markets,
+        # which buckets) is unchanged — only the SIDE flips. No re-gating on
+        # min_ev or min_model_prob: the inversion is a strategic mirror, not a
+        # fresh evaluation. NO-side originals pass through untouched.
+        if settings.contrarian_yes_inversion and side == "yes":
+            side = "no"
+            side_prob = p_no
+            side_ask = ask_no
+            side_ev = ev_no if ev_no > -1.0 else compute_ev(p_no, ask_no)
+            trade_token = bucket.no_token_id or bucket.token_id
+            logger.info(
+                f"  CONTRARIAN: YES→NO on {bucket.outcome_label} "
+                f"(yes_prob={p_yes:.2f} ask_yes={ask_yes:.3f} → "
+                f"no_prob={p_no:.2f} ask_no={side_ask:.3f})"
+            )
+
         size = suggested_position_size(side_prob, side_ask, bankroll, kelly_mult, max_usdc)
         kf = kelly_fraction(side_prob, side_ask)
 

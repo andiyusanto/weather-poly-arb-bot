@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     # and the model is anti-predictive (resolved data: every winner had side
     # prob >=0.76, every loser <=0.57). Only bet outcomes we think are likely.
     min_model_prob: float = 0.55
+    # When True: every market the strategy would buy YES on is instead bought as NO
+    # on the same bucket (same event, opposite outcome token). The bot's YES picks
+    # have shown a stable -5.5% win-rate gap below break-even across 4 weekly
+    # cohorts (n=95 post-gate); the mirror gap is +5.5% on the NO side of those
+    # same markets. This flag captures that mirror. NO-side picks are unaffected
+    # (they're already approximately market-fair). DRY_RUN/shadow first.
+    contrarian_yes_inversion: bool = False
     # Open-Meteo ensemble horizon is 16 days. Cap at 15d so every market we
     # surface has at least one valid forecast member.
     max_hours_to_resolution: float = 360.0
