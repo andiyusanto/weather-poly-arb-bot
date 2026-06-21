@@ -740,5 +740,162 @@ def yes_score(
     )
 
 
+@app.command()
+def contrarian_pnl(
+    since_id: int = typer.Option(
+        0, "--since", help="Only include trades with id > this. Default 0 = all rows since the flag went live."
+    ),
+) -> None:
+    """
+    Validate the contrarian-YES-inversion strategy (Option F) against natural NO bets.
+
+    Splits resolved shadow trades into three buckets and compares performance:
+      • contrarian=1     — YES picks that were flipped to NO at the real NO ask
+      • natural NO       — NO picks the strategy made on its own
+      • natural YES      — YES picks (pre-flag, or if the flag is off in current state)
+
+    For the contrarian strategy to be validated forward, three things should hold:
+      1. contrarian win rate clearly above its avg break-even (positive 'gap')
+      2. positive ROI across multiple weekly cohorts, not just total
+      3. contrarian ROI noticeably better than the natural-YES baseline
+    """
+    setup_logging()
+    _banner()
+
+    import sqlite3
+    import math
+    from datetime import datetime
+    from collections import defaultdict
+    from rich.table import Table
+    from config.settings import TRADES_DB
+
+    with sqlite3.connect(TRADES_DB) as conn:
+        conn.row_factory = sqlite3.Row
+        # Make sure the column exists (auto-migrated on TradeStore init).
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+        if "contrarian" not in cols:
+            console.print(
+                "[red]No 'contrarian' column in trades table — restart the trade service "
+                "once to trigger the schema migration, then re-run this command.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        rows = conn.execute(
+            f"""SELECT id, side, contrarian, market_price, model_prob, size_usdc,
+                       outcome, pnl, timestamp
+                FROM trades
+                WHERE outcome IS NOT NULL AND id > {int(since_id)}
+                ORDER BY id"""
+        ).fetchall()
+        rows = [dict(r) for r in rows]
+
+    if not rows:
+        console.print(f"[yellow]No resolved trades with id > {since_id}.[/yellow]")
+        return
+
+    def _bucket(r: dict) -> str:
+        if r.get("contrarian"):
+            return "contrarian (YES→NO)"
+        return "natural NO" if r["side"] == "no" else "natural YES"
+
+    def _summarise(subset: list[dict]) -> dict:
+        n = len(subset)
+        if n == 0:
+            return dict(n=0, wins=0, win_pct=0.0, avg_ask=0.0, gap=0.0,
+                        pnl=0.0, deployed=0.0, roi=0.0, ci_lo=0.0, ci_hi=0.0)
+        wins = sum(1 for r in subset if r["outcome"] == r["side"])
+        ask = sum(r["market_price"] for r in subset) / n
+        wr = wins / n
+        se = math.sqrt(wr * (1 - wr) / n) if n > 1 else 0
+        pnl = sum(r["pnl"] or 0 for r in subset)
+        dep = sum(r["size_usdc"] or 0 for r in subset)
+        return dict(
+            n=n, wins=wins, win_pct=wr * 100, avg_ask=ask, gap=(wr - ask) * 100,
+            pnl=pnl, deployed=dep, roi=(pnl / dep * 100) if dep else 0.0,
+            ci_lo=max(0, wr - 1.96 * se) * 100, ci_hi=min(1, wr + 1.96 * se) * 100,
+        )
+
+    groups = defaultdict(list)
+    for r in rows:
+        groups[_bucket(r)].append(r)
+
+    contrarian = _summarise(groups.get("contrarian (YES→NO)", []))
+    natural_no = _summarise(groups.get("natural NO", []))
+    natural_yes = _summarise(groups.get("natural YES", []))
+
+    scope = "ALL resolved trades" if since_id == 0 else f"id > {since_id}"
+    console.print(f"\n[bold cyan]Contrarian P&L review — {scope}[/bold cyan]\n")
+
+    if contrarian["n"] == 0:
+        console.print(
+            "[yellow]No resolved contrarian trades yet.[/yellow]\n"
+            "[dim]Either the flag was just turned on (give the resolve cron time), or "
+            "no YES picks have triggered since enabling. Check `grep CONTRARIAN logs/bot_*.log`.[/dim]\n"
+        )
+
+    table = Table(title="Strategy comparison", header_style="bold magenta", border_style="dim")
+    for col in ("metric", "contrarian (YES→NO)", "natural NO", "natural YES (baseline)"):
+        table.add_column(col, no_wrap=True)
+    rows_render = [
+        ("resolved",      contrarian["n"],        natural_no["n"],        natural_yes["n"]),
+        ("wins",          contrarian["wins"],     natural_no["wins"],     natural_yes["wins"]),
+        ("win rate",      f'{contrarian["win_pct"]:.1f}%', f'{natural_no["win_pct"]:.1f}%', f'{natural_yes["win_pct"]:.1f}%'),
+        ("  95% CI",      f'[{contrarian["ci_lo"]:.1f}%, {contrarian["ci_hi"]:.1f}%]',
+                          f'[{natural_no["ci_lo"]:.1f}%, {natural_no["ci_hi"]:.1f}%]',
+                          f'[{natural_yes["ci_lo"]:.1f}%, {natural_yes["ci_hi"]:.1f}%]'),
+        ("avg ask (BE)",  f'{contrarian["avg_ask"]:.3f}', f'{natural_no["avg_ask"]:.3f}', f'{natural_yes["avg_ask"]:.3f}'),
+        ("win vs BE",     f'{contrarian["gap"]:+.1f}%',   f'{natural_no["gap"]:+.1f}%',   f'{natural_yes["gap"]:+.1f}%'),
+        ("P&L",           f'${contrarian["pnl"]:+,.2f}',  f'${natural_no["pnl"]:+,.2f}',  f'${natural_yes["pnl"]:+,.2f}'),
+        ("deployed",      f'${contrarian["deployed"]:,.0f}', f'${natural_no["deployed"]:,.0f}', f'${natural_yes["deployed"]:,.0f}'),
+        ("ROI",           f'{contrarian["roi"]:+.1f}%',   f'{natural_no["roi"]:+.1f}%',   f'{natural_yes["roi"]:+.1f}%'),
+    ]
+    for r in rows_render:
+        table.add_row(*[str(c) for c in r])
+    console.print(table)
+
+    # Verdict line on contrarian alone — the critical "edge or no edge" call.
+    if contrarian["n"] >= 10:
+        if contrarian["ci_lo"] > contrarian["avg_ask"] * 100:
+            verdict = "🟢 EDGE CONFIRMED — CI lower bound clears break-even"
+        elif contrarian["ci_hi"] < contrarian["avg_ask"] * 100:
+            verdict = "🔴 EDGE REJECTED — CI upper bound below break-even"
+        else:
+            verdict = "🟡 inconclusive — break-even sits inside CI; need more samples"
+        console.print(f"  [contrarian] n={contrarian['n']}: {verdict}\n")
+    elif contrarian["n"] > 0:
+        console.print(f"  [contrarian] n={contrarian['n']}: too few to judge — need ≥10 resolved\n")
+
+    # Cohort robustness: weekly split of contrarian P&L.
+    if contrarian["n"] >= 5:
+        weekly = defaultdict(list)
+        for r in groups["contrarian (YES→NO)"]:
+            try:
+                w = datetime.fromisoformat(r["timestamp"].replace("Z", "+00:00")).strftime("%Y-W%U")
+            except Exception:
+                w = "?"
+            weekly[w].append(r)
+        ctab = Table(title="Contrarian — weekly cohort split (positive in every week = robust edge)",
+                     header_style="bold magenta", border_style="dim")
+        for col in ("week", "n", "wins", "win%", "avg ask", "gap", "P&L", "ROI"):
+            ctab.add_column(col, no_wrap=True)
+        for w in sorted(weekly):
+            s = _summarise(weekly[w])
+            gap_color = "green" if s["gap"] > 0 else "red"
+            roi_color = "green" if s["roi"] > 0 else "red"
+            ctab.add_row(
+                w, str(s["n"]), str(s["wins"]),
+                f'{s["win_pct"]:.1f}%', f'{s["avg_ask"]:.3f}',
+                f'[{gap_color}]{s["gap"]:+.1f}%[/{gap_color}]',
+                f'${s["pnl"]:+.2f}',
+                f'[{roi_color}]{s["roi"]:+.1f}%[/{roi_color}]',
+            )
+        console.print(ctab)
+        positive_weeks = sum(1 for w in weekly if _summarise(weekly[w])["roi"] > 0)
+        console.print(
+            f"  [dim]positive cohorts: {positive_weeks}/{len(weekly)}. "
+            f"All-weeks-positive is the robust-edge signal; mixed weeks = wait/variance.[/dim]\n"
+        )
+
+
 if __name__ == "__main__":
     app()
