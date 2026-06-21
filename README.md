@@ -328,6 +328,8 @@ Key settings written by `setup.py` + manual options:
 | `MIN_CONFIDENCE` | Min ensemble confidence | `0.55` |
 | `MAX_HOURS_TO_RESOLUTION` | Only trade within N hours | `720` |
 | `ENSEMBLE_MODELS` | Open-Meteo model list | `icon_seamless,gfs_seamless,ecmwf_ifs025` |
+| `MIN_MODEL_PROB` | Side-prob gate: minimum probability for the bet side | `0.55` |
+| `CONTRARIAN_YES_INVERSION` | If `true`, every YES pick is bought as NO on the same bucket at the real NO ask. See **Contrarian YES Inversion (Option F)** under Analytics & Edge Validation. | `false` |
 
 ---
 
@@ -606,6 +608,22 @@ Reading the LOO accuracy row:
 - **15pp+ above base, stable across 2–3 reruns** → real signal, candidate for deployment
 
 Re-run every ~20 new YES resolves. When LOO accuracy stabilises meaningfully above base rate, the score is ready to wire into the strategy as a YES-side filter — a separate, post-validation decision.
+
+#### `python run.py contrarian-pnl` — validate the contrarian-inversion strategy
+
+Three-way comparison of resolved shadow trades — **contrarian (YES→NO flipped)** vs **natural NO** vs **natural YES baseline** — plus a weekly cohort split so you can tell a real edge from a single-cohort lucky streak. See the **Contrarian YES Inversion (Option F)** section below for the strategy rationale.
+
+```bash
+python run.py contrarian-pnl                  # all resolved rows
+python run.py contrarian-pnl --since 1500     # only id > 1500 (e.g. since the flag went live)
+```
+
+Reading the output:
+
+- **🟢 EDGE CONFIRMED** — contrarian CI lower bound clears its avg ask (= break-even). Deploy with small live size.
+- **🟡 inconclusive** — break-even sits inside CI. Keep collecting; check again every 20–30 new resolves.
+- **🔴 EDGE REJECTED** — contrarian CI upper bound is below break-even. The in-sample edge didn't survive forward. Flip the flag off, stop YES bets via min_model_prob = 1.0, fall back to NO-only.
+- **All weeks positive** in the cohort table is the robust-edge signal — the same pattern that distinguished Option F from earlier false positives (which all looked great in aggregate but had at least one losing cohort).
 
 ### Backtest with per-type breakdown
 
@@ -966,6 +984,47 @@ The validation workflow can take 10–15 days of shadowing per ~100-trade chunk 
 - **Do not reset `trades.db`** — the calibration curve currently fit on N samples is an asset; throwing it away costs you days
 
 The single most common failure mode of this kind of bot is **changing strategy mid-shadow because of psychological discomfort with a temporary drawdown.** The cohort split tells you whether the drawdown is the early-cohort drag (acceptable) or a real regression (signal). Trust the metric, not the gut.
+
+### Contrarian YES Inversion (Option F)
+
+A finding from deep-diving the post-gate YES sample at n=95: the bot's YES picks have a **stable -5.5% win-rate gap below break-even, consistent across four weekly cohorts.** That's not noise around fair — it's a structural fingerprint of the temperature KDE being overconfident exactly in the band where the strategy chooses to act. The mirror of that fingerprint is a +5.5% gap on the **NO side of those same markets**.
+
+Mechanism in plain words:
+
+1. The model's KDE assigns ~55–65% probability to "moderate-tail" temperature buckets (1–3°F from the bias-corrected forecast mean).
+2. A naive Gaussian centered at the same forecast mean with σ = empirical error std (~2.0°F) assigns 10–25% to those same buckets.
+3. The market prices them at ~33%.
+4. Reality lands at ~24% (very close to the Gaussian and the market, not the KDE).
+5. Buying YES at the market ask therefore overpays for forecast confidence the model can't actually deliver.
+6. Buying **NO** on the same bucket at the real NO ask captures the mirror — pay `1 − p` for the bet that wins `1 − p + 0.055` of the time.
+
+Mathematically:
+
+```
+YES side  :  ask = p, realized win rate = p − 0.055        ROI ≈ −5.5%
+NO side   :  ask = 1−p, realized win rate = (1−p) + 0.055  ROI ≈ +5.5%
+```
+
+The strategy is implemented as a config flag, not a code branch:
+
+```bash
+# .env
+CONTRARIAN_YES_INVERSION=true
+```
+
+When set, [src/strategy.py](src/strategy.py) runs the normal decision logic unchanged — same markets scanned, same buckets evaluated, same `min_ev` and `min_model_prob` gates applied — and only flips the SIDE at the very end if the chosen side is YES. Natural NO picks pass through untouched. Each inverted trade is recorded with a `contrarian=1` flag in `trades.db` so analytics can isolate them.
+
+**Why this is unusual but defensible:** the contrarian play profits from your own model's known broken-ness. It's not a strategy you keep forever; it's a strategy you deploy while you investigate or fix the root cause (KDE bandwidth, ensemble outlier handling, intra-day staleness). The moment the underlying YES overconfidence disappears, the contrarian edge dies too.
+
+**Validation checklist before letting it run live:**
+
+1. Run `python run.py contrarian-pnl` after ~10–15 days of shadow data
+2. The contrarian row must show 🟢 EDGE CONFIRMED (CI lower bound clears its avg ask)
+3. **All weekly cohorts must be positive** — this is the test that prior false-positives (open-ended drop, mid-band gate, lead-time filter) all failed
+4. Contrarian ROI must be noticeably better than natural-YES baseline ROI (otherwise the flag isn't helping)
+5. NO side P&L must not have degraded (the natural NO row is the control group — it should stay near fair)
+
+**If validation fails**, the right pivot is Option E: set `MIN_MODEL_PROB=1.0` to stop all YES picks. NO-only is roughly break-even and produces zero further bleed. Then investigate forecast-pipeline fixes (KDE replacement, ensemble outlier handling) before re-enabling YES bets in any form.
 
 ---
 
