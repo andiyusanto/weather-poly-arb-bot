@@ -213,7 +213,13 @@ def run_trading_cycle(
     traded = _trade_store.traded_bucket_keys()
     def _key(opp: Opportunity) -> tuple:
         td = opp.market.target_date.isoformat() if opp.market.target_date else ""
-        return (opp.market.city or "", td, opp.bucket.outcome_label or "", (opp.side or "yes").lower())
+        return (
+            opp.market.city or "",
+            td,
+            opp.bucket.outcome_label or "",
+            (opp.side or "yes").lower(),
+            int(getattr(opp, "contrarian", False)),
+        )
     fresh = [o for o in result.opportunities if _key(o) not in traded]
     n_dup = len(result.opportunities) - len(fresh)
     if n_dup:

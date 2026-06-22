@@ -252,18 +252,34 @@ class TradeStore:
 
     def traded_bucket_keys(self) -> set[tuple]:
         """
-        Return the set of (city, target_date, bucket_label, side) already traded.
+        Return the set of (city, target_date, bucket_label, side, contrarian) already
+        traded.
 
-        Used to enforce one bet per bucket across cycles: the trader re-scans
-        every interval, so without this guard the same bucket is re-entered each
-        cycle — inflating the shadow sample and over-concentrating live capital.
+        Used to enforce one bet per (bucket, strategy) across cycles: the trader
+        re-scans every interval, so without this guard the same bucket is re-entered
+        each cycle — inflating the shadow sample and over-concentrating live capital.
+
+        The ``contrarian`` flag is part of the key because contrarian NO and natural
+        NO bets on the same bucket are *different* strategies that should be allowed
+        to coexist: natural NO follows the model's NO conviction; contrarian NO is a
+        deliberate mirror of a YES pick. They share an outcome direction but have
+        different mathematical justification, so a prior natural NO should not block
+        a fresh contrarian on the same bucket (and vice versa).
         """
         with sqlite3.connect(self._db) as conn:
-            rows = conn.execute(
-                "SELECT city, target_date, bucket_label, side FROM trades"
-            ).fetchall()
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
+            has_contrarian = "contrarian" in cols
+            sel = "city, target_date, bucket_label, side"
+            sel += ", contrarian" if has_contrarian else ""
+            rows = conn.execute(f"SELECT {sel} FROM trades").fetchall()
         return {
-            ((r[0] or ""), (r[1] or ""), (r[2] or ""), (r[3] or "yes").lower())
+            (
+                (r[0] or ""),
+                (r[1] or ""),
+                (r[2] or ""),
+                (r[3] or "yes").lower(),
+                int(r[4]) if has_contrarian and r[4] is not None else 0,
+            )
             for r in rows
         }
 
