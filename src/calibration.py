@@ -214,11 +214,21 @@ def _load_resolved_trades() -> List[Dict]:
     try:
         with sqlite3.connect(TRADES_DB) as c:
             c.row_factory = sqlite3.Row
+            # Exclude contrarian flips from the calibration training set. Contrarian
+            # bets store model_prob = 1 - p_yes (the NO-side probability) but win
+            # whenever the *original* YES wouldn't — i.e. their model_prob does NOT
+            # describe the empirical win rate of the recorded side. Feeding them in
+            # would poison the curve, which exists to learn "raw model_prob → realized
+            # win rate" on bets where that relationship is honest. Natural NO trades
+            # have honest model_prob = 1 - p_yes AND win when outcome=no, so they
+            # belong in the curve; contrarians do not.
+            cols = {row[1] for row in c.execute("PRAGMA table_info(trades)")}
+            extra = " AND (contrarian IS NULL OR contrarian = 0)" if "contrarian" in cols else ""
             cur = c.execute(
-                """
+                f"""
                 SELECT city, bucket_label, model_prob, market_price, side, outcome
                 FROM trades
-                WHERE shadow=1 AND outcome IS NOT NULL
+                WHERE shadow=1 AND outcome IS NOT NULL{extra}
                 """
             )
             for r in cur.fetchall():

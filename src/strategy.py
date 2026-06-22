@@ -246,27 +246,6 @@ def evaluate_market(
             )
             continue
 
-        # ── Contrarian YES inversion (Option F) ─────────────────────────────
-        # The model's YES picks have a stable structural overconfidence bias.
-        # When this flag is set, every market that EV-passes for YES is bought
-        # as NO on the same bucket instead. The decision logic (which markets,
-        # which buckets) is unchanged — only the SIDE flips. No re-gating on
-        # min_ev or min_model_prob: the inversion is a strategic mirror, not a
-        # fresh evaluation. NO-side originals pass through untouched.
-        inverted = False
-        if settings.contrarian_yes_inversion and side == "yes":
-            side = "no"
-            side_prob = p_no
-            side_ask = ask_no
-            side_ev = ev_no if ev_no > -1.0 else compute_ev(p_no, ask_no)
-            trade_token = bucket.no_token_id or bucket.token_id
-            inverted = True
-            logger.info(
-                f"  CONTRARIAN: YES→NO on {bucket.outcome_label} "
-                f"(yes_prob={p_yes:.2f} ask_yes={ask_yes:.3f} → "
-                f"no_prob={p_no:.2f} ask_no={side_ask:.3f})"
-            )
-
         size = suggested_position_size(side_prob, side_ask, bankroll, kelly_mult, max_usdc)
         kf = kelly_fraction(side_prob, side_ask)
 
@@ -283,7 +262,7 @@ def evaluate_market(
             side=side,
             trade_token_id=trade_token,
             hours_to_resolution=hours_left,
-            contrarian=inverted,
+            contrarian=False,
         ))
 
     if not candidate_opps:
@@ -293,6 +272,65 @@ def evaluate_market(
     # to a SINGLE position per event — the highest-EV side/bucket.
     candidate_opps.sort(key=lambda o: o.ev, reverse=True)
     best = candidate_opps[0]
+
+    # ── Contrarian YES inversion (Option F) ─────────────────────────────────
+    # Applied AFTER the EV sort: if the bot's chosen opportunity is YES, flip
+    # it to NO on the same bucket. Doing this before the sort would demote the
+    # flipped opportunity (its NO-side ev is strongly negative when YES-side ev
+    # is positive) and let an unrelated bucket's natural NO win the event —
+    # silently masking the inversion. The post-sort placement preserves the
+    # principle: pick the strongest bucket per event using the model's own
+    # logic, then mirror its side. Natural NO picks are unaffected.
+    #
+    # Sizing: the contrarian bet has negative model-EV by construction (we are
+    # explicitly betting against our own probability), so Kelly would size it at
+    # $0 and apply_daily_limit would drop it. The empirical edge is in the
+    # MIRROR direction: when the model says YES, we believe (from the -5.5%
+    # win-rate gap) that NO is the better bet at the same dollar conviction.
+    # We therefore preserve the YES-side suggested size — same conviction,
+    # opposite direction. The recorded `ev` is the actual bet's ev (negative),
+    # which is honest accounting; the empirical edge isn't visible in any single
+    # bet's ev, only in the realized win rate across the cohort.
+    if settings.contrarian_yes_inversion and best.side == "yes":
+        b = best.bucket
+        new_ask = b.no_ask
+        new_token = b.no_token_id
+
+        # Defensive: skip the flip if the NO side of this bucket is unusable.
+        # Falling back to the YES token at the NO ask would silently mislabel a
+        # YES purchase as a NO bet — wrong settlement, wrong outcome resolution.
+        if not new_token:
+            logger.warning(
+                f"  CONTRARIAN: cannot invert {b.outcome_label} — no_token_id missing; "
+                f"skipping bet entirely (would mislabel YES token as NO)"
+            )
+            return []
+        if new_ask <= 0.0 or new_ask >= 1.0:
+            logger.warning(
+                f"  CONTRARIAN: cannot invert {b.outcome_label} — no_ask={new_ask} "
+                f"out of range; no quoted NO market"
+            )
+            return []
+
+        new_prob = 1.0 - best.model_prob
+        new_ev = compute_ev(new_prob, new_ask)
+        logger.info(
+            f"  CONTRARIAN: YES→NO on {b.outcome_label} "
+            f"(yes_prob={best.model_prob:.2f} ask_yes={best.market_price:.3f} → "
+            f"no_prob={new_prob:.2f} ask_no={new_ask:.3f}) "
+            f"size=${best.suggested_size_usdc:.2f} (preserved from YES Kelly)"
+        )
+        best = Opportunity(
+            market=best.market, bucket=best.bucket, forecast=best.forecast,
+            model_prob=new_prob, market_price=new_ask, ev=new_ev,
+            confidence=best.confidence,
+            # Keep the original YES Kelly fraction for downstream introspection;
+            # the size that actually gets used is suggested_size_usdc.
+            kelly_fraction=best.kelly_fraction,
+            suggested_size_usdc=best.suggested_size_usdc,
+            side="no", trade_token_id=new_token,
+            hours_to_resolution=best.hours_to_resolution, contrarian=True,
+        )
 
     logger.info(
         f"  EDGE [{market.market_type.emoji}]: {best.bucket.outcome_label} {best.side.upper()} "

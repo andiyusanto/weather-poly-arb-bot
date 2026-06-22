@@ -82,3 +82,52 @@ def test_gates_still_apply_before_inversion() -> None:
     # Inversion must NOT rescue this; gates are checked before the flip.
     with patch.object(settings, "contrarian_yes_inversion", True):
         assert _evaluate(0.10, 0.05, 0.90) == []
+
+
+def test_inversion_wins_against_competing_natural_no_in_same_event() -> None:
+    # Regression for the bug found on 2026-06-22: when the flip happened per-bucket
+    # *inside* the loop, the flipped NO opportunity got a strongly negative ev and
+    # lost the cross-bucket EV sort to any other bucket's natural NO. The correct
+    # behaviour is: pick the best-EV opp per event first (which is the YES one
+    # here), THEN flip its side. The contrarian must survive the sort.
+    from src.polymarket_client import MarketType, WeatherBucket, WeatherMarket
+
+    bucket_strong_yes = WeatherBucket(
+        token_id="yes-A", outcome_label="72°F or higher", lower=72.0, upper=999.0,
+        no_token_id="no-A", best_ask=0.30, best_ask_no=0.70,
+    )
+    bucket_weak_no = WeatherBucket(
+        token_id="yes-B", outcome_label="60°F or lower", lower=-999.0, upper=60.0,
+        no_token_id="no-B", best_ask=0.85, best_ask_no=0.50,
+    )
+    market = WeatherMarket(
+        market_id="m-multi", question="q", city="Testville",
+        target_date=(now_utc() + timedelta(hours=24)).date(),
+        resolution_datetime=now_utc() + timedelta(hours=24),
+        market_type=MarketType.TEMPERATURE,
+        buckets=[bucket_strong_yes, bucket_weak_no],
+    )
+
+    # Forecast: 0.70 prob for bucket A (strong YES at 0.30 ask, ev=+1.33), but
+    # 0.40 prob for bucket B (natural NO at 0.50 ask, p_no=0.60, ev=+0.20).
+    class _Fcast:
+        confidence = 0.95
+        def all_bucket_probabilities(self, buckets):
+            return {bucket_strong_yes: 0.70, bucket_weak_no: 0.40}
+
+    with patch("src.calibration.calibrate_probability", side_effect=lambda p, t: p), \
+         patch("src.calibration.city_skill_factor", return_value=1.0), \
+         patch.object(settings, "contrarian_yes_inversion", True):
+        opps = evaluate_market(market, _Fcast(), min_ev=0.20)
+
+    assert len(opps) == 1
+    opp = opps[0]
+    # The contrarian flip MUST have landed on bucket A (the original YES winner).
+    # Pre-fix, the natural NO at bucket B would have stolen the event because
+    # the per-bucket flip gave bucket A's contrarian a negative ev.
+    assert opp.contrarian is True, "contrarian flip lost to a natural NO — pre-fix bug"
+    assert opp.bucket is bucket_strong_yes
+    assert opp.side == "no"
+    assert opp.trade_token_id == "no-A"
+    assert abs(opp.market_price - 0.70) < 1e-9   # bucket A's no_ask
+    assert abs(opp.model_prob - 0.30) < 1e-9     # 1 − 0.70
