@@ -60,7 +60,10 @@ def _log_startup_state(mode: str) -> None:
             return "?"
 
     commit = _git("rev-parse", "--short=8", "HEAD")
-    dirty = _git("status", "--porcelain")
+    # Only count modifications to TRACKED files as DIRTY. Untracked artifacts
+    # like local sqlite DBs, logs, and ad-hoc scratch files are not strategy
+    # drift — they shouldn't make the startup line scream.
+    dirty = _git("status", "--porcelain", "--untracked-files=no")
     dirty_flag = "DIRTY" if dirty and dirty != "?" else "clean"
 
     # Source mtimes for the modules most likely to drift on this project.
