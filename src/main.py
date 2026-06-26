@@ -37,6 +37,64 @@ def _banner() -> None:
         console.print("[bold yellow]  ⚠️  DRY RUN MODE — no real orders will be placed[/bold yellow]\n")
 
 
+def _log_startup_state(mode: str) -> None:
+    """
+    Emit a single sworn-statement line that proves what code + config is running.
+
+    Solves the "is the running process actually the latest?" mystery: every restart
+    visibly prints the git commit, key source file mtimes, and the gating settings
+    in the first few log lines. If a stale process is ever serving traffic, this
+    line tells you immediately. Logged at INFO so it lands in the rotated log files.
+    """
+    import os
+    import subprocess
+    from pathlib import Path
+
+    def _git(*args: str) -> str:
+        try:
+            out = subprocess.run(
+                ["git", *args], capture_output=True, text=True, timeout=2, check=False
+            )
+            return (out.stdout or "").strip() or "?"
+        except Exception:
+            return "?"
+
+    commit = _git("rev-parse", "--short=8", "HEAD")
+    dirty = _git("status", "--porcelain")
+    dirty_flag = "DIRTY" if dirty and dirty != "?" else "clean"
+
+    # Source mtimes for the modules most likely to drift on this project.
+    project_root = Path(__file__).resolve().parent.parent
+    def _mtime(rel: str) -> str:
+        p = project_root / rel
+        if not p.exists():
+            return "missing"
+        return datetime.utcfromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    logger.info(
+        "STARTUP "
+        f"mode={mode} "
+        f"git={commit} ({dirty_flag}) "
+        f"contrarian_yes_inversion={settings.contrarian_yes_inversion} "
+        f"min_model_prob={settings.min_model_prob} "
+        f"min_ev={settings.min_ev_threshold} "
+        f"kelly={settings.kelly_fraction} "
+        f"max_trade_usdc={settings.max_trade_usdc} "
+        f"daily_max_usdc={settings.daily_max_usdc} "
+        f"max_hours_to_resolution={settings.max_hours_to_resolution} "
+        f"dry_run={settings.dry_run} "
+        f"pid={os.getpid()}"
+    )
+    logger.info(
+        "STARTUP source-mtimes "
+        f"strategy.py={_mtime('src/strategy.py')} "
+        f"trader.py={_mtime('src/trader.py')} "
+        f"utils.py={_mtime('src/utils.py')} "
+        f"forecast.py={_mtime('src/forecast.py')} "
+        f"calibration.py={_mtime('src/calibration.py')}"
+    )
+
+
 @app.command()
 def scan(
     min_ev: float = typer.Option(settings.min_ev_threshold, "--min-ev", help="Min EV threshold (0–1)"),
@@ -92,6 +150,11 @@ def trade(
         # --shadow implies no live order, but we still need CLOB prices
         console.print("[bold yellow]  🟡 SHADOW MODE — recording trades for outcome validation[/bold yellow]\n")
         dry_run = True  # prevent any accidental live order path
+
+    # Sworn-statement startup log so any future "is the bot running stale code?"
+    # question is a 2-second answer — search for STARTUP in the day's log.
+    _mode = "shadow" if shadow else ("dry_run" if dry_run else "live")
+    _log_startup_state(_mode)
 
     if not dry_run and not shadow:
         if not settings.has_clob_creds:
