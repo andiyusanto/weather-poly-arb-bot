@@ -74,6 +74,8 @@ def _log_startup_state(mode: str) -> None:
             return "missing"
         return datetime.utcfromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    allow = settings.city_allowlist_set
+    allow_str = f"{len(allow)} cities" if allow else "none (trade all)"
     logger.info(
         "STARTUP "
         f"mode={mode} "
@@ -85,6 +87,7 @@ def _log_startup_state(mode: str) -> None:
         f"max_trade_usdc={settings.max_trade_usdc} "
         f"daily_max_usdc={settings.daily_max_usdc} "
         f"max_hours_to_resolution={settings.max_hours_to_resolution} "
+        f"city_allowlist={allow_str} "
         f"dry_run={settings.dry_run} "
         f"pid={os.getpid()}"
     )

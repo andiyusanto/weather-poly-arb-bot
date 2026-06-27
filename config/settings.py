@@ -69,6 +69,21 @@ class Settings(BaseSettings):
     # same markets. This flag captures that mirror. NO-side picks are unaffected
     # (they're already approximately market-fair). DRY_RUN/shadow first.
     contrarian_yes_inversion: bool = False
+    # Comma-separated allowlist of cities to trade. Empty string = no filter
+    # (trade all discovered cities). When set, scanner skips every market whose
+    # city is not in the list — including the forecast fetch, so it's cheap.
+    #
+    # Use case: the bot's NO bets show a city-level pattern in resolved history.
+    # Inland-continental and stable-tropical cities (Mexico City, Wuhan,
+    # Guangzhou, Moscow, Jeddah, Manila, Chengdu) are +5/+8/+12% ROI cells
+    # with 5/5 positive weekly cohorts on n=474. Maritime/transitional cities
+    # (Tokyo, Istanbul, Panama City, Miami, Helsinki) are -8/-13% bleeders.
+    # The Open-Meteo ensemble is meteorologically better at simple climates,
+    # the market doesn't differentiate — that's the edge thesis.
+    #
+    # Match is case-insensitive and trimmed. Example .env line:
+    #   CITY_ALLOWLIST=Mexico City,Wuhan,Guangzhou,Moscow,Jeddah,Manila,Chengdu
+    city_allowlist: str = ""
     # Open-Meteo ensemble horizon is 16 days. Cap at 15d so every market we
     # surface has at least one valid forecast member.
     max_hours_to_resolution: float = 360.0
@@ -131,6 +146,14 @@ class Settings(BaseSettings):
     @property
     def enabled_market_type_set(self) -> set:
         return {t.strip().lower() for t in self.enabled_market_types.split(",") if t.strip()}
+
+    @property
+    def city_allowlist_set(self) -> set:
+        """
+        Lower-cased set of allowed cities; empty set means "no filter".
+        Used by scanner.run_scan to drop markets early, saving Open-Meteo quota.
+        """
+        return {c.strip().lower() for c in self.city_allowlist.split(",") if c.strip()}
 
     @property
     def has_telegram(self) -> bool:

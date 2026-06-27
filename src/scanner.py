@@ -202,6 +202,19 @@ def run_scan(
                 continue
         active_markets.append(m)
 
+    # City allowlist filter — applied BEFORE forecast fetch so disallowed cities
+    # don't consume Open-Meteo quota. Empty allowlist = no filter (trade all).
+    # See settings.city_allowlist for the edge thesis and resolved-data sample.
+    allow = settings.city_allowlist_set
+    if allow:
+        before = len(active_markets)
+        active_markets = [m for m in active_markets if (m.city or "").strip().lower() in allow]
+        dropped = before - len(active_markets)
+        if dropped:
+            logger.info(
+                f"City allowlist (n={len(allow)}): dropped {dropped} markets, kept {len(active_markets)}"
+            )
+
     # Liquidity filter — drop buckets below the volume floor. Precip/snow
     # buckets often sit at ~$0 of 24h volume; trading those is a coin flip.
     min_vol = settings.min_bucket_volume_usdc
