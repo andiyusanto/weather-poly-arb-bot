@@ -41,8 +41,14 @@ def _market(best_ask: float) -> WeatherMarket:
 
 def _evaluate(prob: float, best_ask: float):
     # Force calibration to identity + neutral skill so we test the gate directly.
+    # Also force the contrarian flag OFF so it doesn't interfere with gate-only
+    # assertions — those tests are about whether the YES gate passes/fails the
+    # bet, not whether a passing YES then gets mirrored to NO. The fixture
+    # bucket has best_ask_no=0 which would (correctly) cause the contrarian
+    # flip to refuse and return [] when the flag is on globally via env var.
     with patch("src.calibration.calibrate_probability", side_effect=lambda p, t: p), \
-         patch("src.calibration.city_skill_factor", return_value=1.0):
+         patch("src.calibration.city_skill_factor", return_value=1.0), \
+         patch.object(settings, "contrarian_yes_inversion", False):
         return evaluate_market(_market(best_ask), _FakeForecast(prob), min_ev=0.20)
 
 

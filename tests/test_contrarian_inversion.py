@@ -110,10 +110,12 @@ def test_inversion_wins_against_competing_natural_no_in_same_event() -> None:
 
     # Forecast: 0.70 prob for bucket A (strong YES at 0.30 ask, ev=+1.33), but
     # 0.40 prob for bucket B (natural NO at 0.50 ask, p_no=0.60, ev=+0.20).
+    # The forecast contract is keyed by (lower, upper) tuples, not bucket objects
+    # — WeatherBucket isn't hashable. See normalize_bucket_probs in strategy.py.
     class _Fcast:
         confidence = 0.95
         def all_bucket_probabilities(self, buckets):
-            return {bucket_strong_yes: 0.70, bucket_weak_no: 0.40}
+            return {(72.0, 999.0): 0.70, (-999.0, 60.0): 0.40}
 
     with patch("src.calibration.calibrate_probability", side_effect=lambda p, t: p), \
          patch("src.calibration.city_skill_factor", return_value=1.0), \
