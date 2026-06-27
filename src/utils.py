@@ -33,9 +33,14 @@ def setup_logging() -> None:
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> — <level>{message}</level>",
         colorize=True,
     )
-    log_file = LOGS_DIR / f"bot_{datetime.now().strftime('%Y%m%d')}.log"
+    # Use loguru's own time-templating ({time:YYYYMMDD}) so the date is resolved
+    # at WRITE time, not at process start. Without this the path is frozen at
+    # startup — a process started today keeps writing to today's file forever,
+    # and at midnight loguru rotates it but reopens the SAME frozen path,
+    # leaving a wrong-day filename and a discontinuous log for post-mortems.
+    log_file = str(LOGS_DIR / "bot_{time:YYYYMMDD}.log")
     logger.add(
-        str(log_file),
+        log_file,
         level="DEBUG",
         rotation="00:00",
         retention="14 days",

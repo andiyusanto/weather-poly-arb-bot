@@ -190,8 +190,34 @@ def trade(
 
     # Scheduled mode
     console.print(f"[green]Scheduling scan every {interval} minutes...[/green]")
+    # Make APScheduler verbose under our logger so "missed cycle" events are
+    # visible in our normal log files instead of disappearing into APScheduler's
+    # default handler. Without this, a long-running cycle silently swallows all
+    # subsequent triggers — seen 2026-06-27: ~6h gap between cycles with zero
+    # visible diagnostic.
+    import logging as _stdlib_logging
+    _stdlib_logging.basicConfig(level=_stdlib_logging.WARNING)
+    _stdlib_logging.getLogger("apscheduler").setLevel(_stdlib_logging.INFO)
+
     scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(_cycle, "interval", minutes=interval, next_run_time=datetime.utcnow())
+    scheduler.add_job(
+        _cycle,
+        "interval",
+        minutes=interval,
+        next_run_time=datetime.utcnow(),
+        # max_instances=1 (default): only one cycle at a time — Kelly + dedup
+        # depend on sequential execution.
+        max_instances=1,
+        # coalesce=True: if multiple triggers were missed while a cycle ran
+        # long, collapse them into a single immediate catch-up firing instead
+        # of stacking up.
+        coalesce=True,
+        # misfire_grace_time: how late a scheduled fire can be before
+        # APScheduler drops it. Default is 1 second — far too aggressive given
+        # our cycle takes 30s-3min normally. 5-minute grace tolerates network
+        # blips, GC pauses, and the occasional slow forecast.
+        misfire_grace_time=300,
+    )
     try:
         scheduler.start()
     except KeyboardInterrupt:
