@@ -304,9 +304,11 @@ def resolve_open_trades(verbose: bool = False) -> List[dict]:
 
     cond_ids = [_cid(t) for t in open_trades]
     n_unique = len({c for c in cond_ids if c})
+    n_live = sum(1 for t in open_trades if not t.get("shadow") and not t.get("dry_run"))
+    n_shadow = len(open_trades) - n_live
     logger.info(
-        f"Checking resolution for {len(open_trades)} open shadow trades "
-        f"({n_unique} unique markets)…"
+        f"Checking resolution for {len(open_trades)} open trades "
+        f"({n_shadow} shadow + {n_live} live, {n_unique} unique markets)…"
     )
     resolutions = fetch_market_resolutions(cond_ids)
 
