@@ -840,12 +840,33 @@ def place_market_order(
     YES token id; to buy NO, pass the NO token id (clobTokenIds[1]). The
     `side` argument is a label for logging/recording — the actual side at the
     CLOB is always BUY.
+
+    Routing:
+      * dry_run / settings.dry_run / shadow → log-only short-circuit
+      * settings.use_sdk_executor=True → deposit-wallet SDK path (post-V2)
+      * otherwise → legacy py-clob direct-EOA path (kept as fallback)
     """
     if dry_run or settings.dry_run:
         logger.info(f"[DRY RUN] Would BUY {side} token {token_id} for ${size_usdc:.2f} USDC")
         return {"status": "dry_run", "token_id": token_id, "side": side,
                 "size_usdc": size_usdc, "order_id": "DRY_RUN"}
 
+    # ── Deposit-wallet SDK path (Polymarket V2, post-2026-04-28) ────────────
+    # The legacy direct-EOA path below stopped working for new wallets after
+    # the V2 cutover. The SDK signs deposit-wallet (POLY_1271) orders through
+    # the relayer. See src/sdk_executor.py + the bear-bot reference. The async
+    # bridge is intentional: weather bot's trading loop is sync, the SDK is
+    # async-first; per-call asyncio.run() is fine at ~10-20 orders/day.
+    if settings.use_sdk_executor:
+        import asyncio
+        from src.sdk_executor import sdk_place_market_order
+        try:
+            return asyncio.run(sdk_place_market_order(token_id, side, size_usdc))
+        except Exception as e:
+            logger.error(f"SDK execution failed (token={token_id}, side={side}): {e}")
+            return {"status": "error", "error": str(e), "path": "sdk"}
+
+    # ── Legacy py-clob direct-EOA path (kept for grandfathered wallets) ─────
     clob = _get_clob_client()
     if not clob:
         logger.error("CLOB client unavailable — cannot place order")
@@ -860,4 +881,4 @@ def place_market_order(
                 "size_usdc": size_usdc, "response": resp}
     except Exception as e:
         logger.error(f"Order placement failed: {e}")
-        return {"status": "error", "error": str(e)}
+        return {"status": "error", "error": str(e), "path": "legacy"}

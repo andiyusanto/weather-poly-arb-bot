@@ -330,6 +330,116 @@ Key settings written by `setup.py` + manual options:
 | `ENSEMBLE_MODELS` | Open-Meteo model list | `icon_seamless,gfs_seamless,ecmwf_ifs025` |
 | `MIN_MODEL_PROB` | Side-prob gate: minimum probability for the bet side | `0.55` |
 | `CONTRARIAN_YES_INVERSION` | If `true`, every YES pick is bought as NO on the same bucket at the real NO ask. See **Contrarian YES Inversion (Option F)** under Analytics & Edge Validation. | `false` |
+| `CITY_ALLOWLIST` | Comma-separated cities to trade. Empty = trade all. See **Analytics & Edge Validation**. | `""` |
+| `USE_SDK_EXECUTOR` | `true` routes live orders through the deposit-wallet SDK (Polymarket V2). See **🟢 LIVE SETUP** below. | `false` |
+| `POLY_BUILDER_API_KEY` / `POLY_BUILDER_SECRET` / `POLY_BUILDER_PASSPHRASE` | Builder API credentials from Polymarket → Settings → API Keys. Required when `USE_SDK_EXECUTOR=true`. | — |
+| `POLY_BUILDER_CODE` | Optional Polymarket Builder Code for fee discount. | — |
+| `TAKER_FEE_PCT` | Polymarket taker fee folded into recorded trade size on the SDK path. Weather category = 1.25%. | `1.25` |
+
+---
+
+## 🟢 LIVE SETUP — Deposit Wallet + polymarket-client (CURRENT, WORKING)
+
+> **Polymarket V2 (since 2026-04-28) does NOT permit fresh wallets to trade
+> direct-EOA.** Every new EOA returns `400 maker address not allowed, please
+> use the deposit wallet flow`. The deposit-wallet flow is implemented in the
+> official unified SDK, `polymarket-client`. This section is the live setup
+> using that SDK; the legacy direct-EOA path through `py-clob-client` remains
+> in the code as a fallback (for grandfathered wallets only).
+
+### Three addresses — never confuse them
+
+| label | source | env var | purpose |
+|---|---|---|---|
+| **Magic signer EOA** | Polymarket → Account → Export Private Key | `POLY_PRIVATE_KEY` | Off-chain order signer. Lives only in `.env`. |
+| **Deposit wallet** | Polymarket profile "Address — For API use only" | `POLY_FUNDER_ADDRESS` | The actual trading account (smart contract, POLY_1271). |
+| **Deposit on-ramp** | Polymarket "Transfer Crypto" address | (not a config) | Where you send USDC on Polygon to fund the deposit wallet. Internal router — **never** put this in `POLY_FUNDER_ADDRESS`. |
+
+Verify the right deposit wallet with `derive_wallet.py` before any live order. The SDK rejects mismatched signer/wallet pairs with "wallet does not match the signer".
+
+### 8-step setup
+
+```bash
+# 1) Build the live venv (polymarket-client coexists with py-clob and web3)
+python3 -m venv ~/weatherlive
+~/weatherlive/bin/pip install -r requirements-sdk.txt
+
+# 2) Generate / locate Builder API credentials
+#    Polymarket → Settings → API Keys → create a Builder Key trio
+#    (api_key, secret, passphrase). Save to .env (see below).
+
+# 3) Set .env values for the deposit-wallet schema
+#    POLY_PRIVATE_KEY       = Magic signer EOA private key (0x…)
+#    POLY_FUNDER_ADDRESS    = deposit wallet (from your profile "API use" field)
+#    POLY_BUILDER_API_KEY   = Builder API key
+#    POLY_BUILDER_SECRET    = Builder API secret
+#    POLY_BUILDER_PASSPHRASE= Builder API passphrase
+#    POLY_BUILDER_CODE      = optional fee-discount code
+#    USE_SDK_EXECUTOR       = true
+#    TAKER_FEE_PCT          = 1.25     (weather category)
+
+# 4) Verify the deposit wallet matches what the SDK will derive
+~/weatherlive/bin/python derive_wallet.py
+#    Must print: derived deposit wallet == POLY_FUNDER_ADDRESS
+#    If mismatch: stop, fix POLY_FUNDER_ADDRESS, do not proceed.
+
+# 5) Stage-1 auth check (no funds moved)
+~/weatherlive/bin/python probe_sdk.py
+#    Must print: is_gasless_ready=True + your collateral balance.
+
+# 6) Stage-2 live order probe (one tiny resting limit order, then cancel)
+~/weatherlive/bin/python probe_sdk.py --token-id <NO_TOKEN_ID> --price 0.10
+#    Must print: AcceptedOrder, then a successful cancel.
+#    AcceptedOrder = live order placement works → safe to wire the bot.
+
+# 7) Shadow smoke with the SDK path (still no real orders)
+~/weatherlive/bin/python run.py trade --shadow --once
+#    Confirms the SDK code path imports + runs cleanly in --shadow mode.
+#    (Shadow short-circuits before any order; we are checking imports.)
+
+# 8) Live micro smoke (one real order at $2)
+#    .env: DRY_RUN=false, MAX_TRADE_USDC=2, DAILY_MAX_USDC=4
+~/weatherlive/bin/python run.py trade --once
+#    Inspect logs for "LIVE FILLED" + trade row in data/trades.db with
+#    shadow=0, dry_run=0, order_id populated.
+```
+
+### Helper / diagnostic scripts (all use `.env` next to themselves)
+
+| script | purpose |
+|---|---|
+| `derive_wallet.py` | Compute deposit wallet address from Magic key; verify match with `POLY_FUNDER_ADDRESS`. **Step 4 above.** |
+| `probe_sdk.py` (no args) | Stage-1 auth check — `is_gasless_ready` + collateral balance. **Step 5.** |
+| `probe_sdk.py --token-id X --price 0.10` | Stage-2 live probe — places a tiny resting limit BUY, prints `AcceptedOrder`, then cancels. **Step 6.** |
+
+### Daily run command (live)
+
+```bash
+~/weatherlive/bin/python run.py trade
+```
+
+Run from `~/weatherlive` (it has `polymarket-client`); paper/backtest can keep using the regular `.venv` (no SDK needed for those paths).
+
+### Reverting to the legacy path (emergency)
+
+```bash
+# In .env:
+USE_SDK_EXECUTOR=false
+# Restart the bot. Place orders again go through py-clob-client (sig_type=0,
+# direct EOA). Only works for grandfathered wallets — fresh wallets will hit
+# the V2 maker-address block.
+```
+
+### What the SDK path actually does
+
+- Imports `polymarket.clients.AsyncSecureClient` + `polymarket.auth.BuilderApiKey` (only loaded when `USE_SDK_EXECUTOR=true`).
+- For each order: builds a fresh authenticated client, calls `place_market_order(token_id, side="BUY", amount, order_type="FOK", builder_code=...)`.
+- Bumps below-min orders to clear Polymarket's 5-share floor (avoids silent FOK cancels at high ask prices).
+- Folds `TAKER_FEE_PCT` (1.25% for weather) into the recorded `size_usdc` so downstream PnL is post-fee.
+- Logs every order response and classifies errors (insufficient balance / geoblock / auth) for downstream handling.
+- Wins **auto-redeem** via Polymarket's `auto_redeem_operator` — no manual web3 redemption.
+
+The reference implementation is at `/home/.../bear-oracle-confirmed-sniper/execution/sdk_executor.py` (already live + profitable on the same wallet schema). Patterns reused: `_scale` helper, min-share bump, fee folding, error classification, client init signature.
 
 ---
 

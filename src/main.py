@@ -88,6 +88,8 @@ def _log_startup_state(mode: str) -> None:
         f"daily_max_usdc={settings.daily_max_usdc} "
         f"max_hours_to_resolution={settings.max_hours_to_resolution} "
         f"city_allowlist={allow_str} "
+        f"use_sdk_executor={settings.use_sdk_executor} "
+        f"taker_fee_pct={settings.taker_fee_pct} "
         f"dry_run={settings.dry_run} "
         f"pid={os.getpid()}"
     )

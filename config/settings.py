@@ -37,14 +37,45 @@ class Settings(BaseSettings):
 
     # ── Polymarket ──────────────────────────────────────────────────────────
     # Written by setup.py — do not edit manually
-    poly_private_key: str = ""
-    poly_funder_address: str = ""
-    poly_api_key: str = ""
-    poly_api_secret: str = ""
-    poly_api_passphrase: str = ""
-    poly_sig_type: int = 0
+    poly_private_key: str = ""           # Magic signer EOA — same field both paths
+    poly_funder_address: str = ""        # legacy: EOA; SDK: deposit wallet (POLY_1271)
+    poly_api_key: str = ""               # legacy CLOB Level-2 API key
+    poly_api_secret: str = ""            # legacy
+    poly_api_passphrase: str = ""        # legacy
+    poly_sig_type: int = 0               # legacy: 0=EOA, 1=safe, 2=gnosis. SDK path ignores.
     clob_host: str = "https://clob.polymarket.com"
     gamma_api_host: str = "https://gamma-api.polymarket.com"
+
+    # ── Deposit-wallet SDK live path (Polymarket V2, post-2026-04-28) ───────
+    # Polymarket V2 no longer permits NEW direct-EOA wallets to trade — every
+    # fresh EOA returns "400 maker address not allowed, please use the deposit
+    # wallet flow". The deposit-wallet flow is implemented in the official
+    # `polymarket-client` SDK (AsyncSecureClient). Set this true to route
+    # `place_market_order` through src/sdk_executor.py; the legacy py-clob
+    # path stays as a fallback and runs whenever this is false. The reference
+    # implementation is bear-oracle-confirmed-sniper/execution/sdk_executor.py
+    # (already live + profitable on the same wallet schema).
+    #
+    # When this is true, POLY_FUNDER_ADDRESS must be the DEPOSIT WALLET
+    # (the profile "Address — For API use only" field), NOT the Magic signer
+    # EOA, NOT the on-ramp "Transfer Crypto" address. Verify with
+    # `python3 derive_wallet.py` from the ~/weatherlive venv before any live order.
+    use_sdk_executor: bool = False
+
+    # Builder API key from Polymarket → Settings → API Keys. Required when
+    # use_sdk_executor=true. The SDK signs orders THROUGH the relayer as the
+    # deposit wallet using these credentials.
+    poly_builder_api_key: str = ""
+    poly_builder_secret: str = ""
+    poly_builder_passphrase: str = ""
+    poly_builder_code: str = ""          # optional fee-discount code
+
+    # Polymarket taker fee for the weather category is 1.25% (crypto is 1.8%).
+    # sdk_executor folds this into the recorded trade size so downstream PnL
+    # reflects the real post-fee spend. Limit/maker orders are free but we
+    # always send FOK market orders today, so this always applies on the live
+    # SDK path. The legacy py-clob path doesn't use this (it reports raw size).
+    taker_fee_pct: float = 1.25
 
     # ── Telegram ────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
@@ -165,7 +196,20 @@ class Settings(BaseSettings):
 
     @property
     def has_clob_creds(self) -> bool:
-        return bool(self.poly_private_key and self.poly_api_key)
+        """True when the credentials for whichever execution path is selected
+        are populated. The SDK path needs the Builder API trio (+ deposit wallet
+        in poly_funder_address); the legacy py-clob path needs the CLOB API key.
+        Both always need the signer private key."""
+        if not self.poly_private_key:
+            return False
+        if self.use_sdk_executor:
+            return bool(
+                self.poly_funder_address
+                and self.poly_builder_api_key
+                and self.poly_builder_secret
+                and self.poly_builder_passphrase
+            )
+        return bool(self.poly_api_key)
 
 
 # Singleton — import this everywhere

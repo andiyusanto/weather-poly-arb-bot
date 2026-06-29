@@ -1,0 +1,69 @@
+# Weather bot LIVE venv — existing deps + polymarket-client (deposit-wallet SDK).
+#
+# Live execution (sdk_executor) goes through polymarket-client; market discovery
+# still uses py-clob-client (public book reads, no auth) and bias_recorder still
+# uses httpx, so all must coexist here.
+#
+# Create + install:
+#   python3 -m venv ~/weatherlive
+#   ~/weatherlive/bin/pip install -r requirements-sdk.txt
+#
+# Run the LIVE bot from this venv. Paper/backtest/shadow can keep using the
+# existing venv (it imports cleanly).
+#
+# If pip reports a RESOLUTION CONFLICT (eth-account / pydantic between
+# polymarket-client and py-clob-client / web3), STOP and report — the bear bot
+# resolved this with eth-account 0.13.7; if pip can't find a working pin set,
+# we'll need to migrate book reads off py-clob onto the SDK.
+
+# Core
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+loguru>=0.7.2
+rich>=13.7.0
+typer>=0.9.0
+
+# HTTP / Async
+httpx[http2]>=0.26.0
+requests>=2.31.0
+tenacity>=8.2.3
+
+# Data / Math
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+
+# Scheduling
+APScheduler>=3.10.4
+
+# Geocoding
+geopy>=2.4.1
+
+# Telegram
+python-telegram-bot>=20.7
+
+# Polymarket — legacy direct-EOA path (still used for public book reads
+# fetch_live_prices/fetch_market_resolutions and as a fallback when
+# USE_SDK_EXECUTOR=false).
+py-clob-client>=0.18.0
+
+# Crypto / Auth
+eth-account>=0.10.0
+web3>=6.11.0
+
+# Storage
+tinydb>=4.8.0
+
+# Timezone
+pytz>=2024.1
+tzdata>=2024.1
+
+# YAML
+PyYAML>=6.0.1
+
+# ── Deposit-wallet SDK (CURRENT live path, since Polymarket V2 cutover) ──
+# Public pre-release; exact pin so pip installs the pre-release without a
+# global --pre. Mirrors the version validated by bear-oracle-confirmed-sniper.
+polymarket-client==0.1.0b9
