@@ -288,14 +288,35 @@ class TradeStore:
             for r in rows
         }
 
-    def open_shadow_trades(self) -> list[dict]:
-        """Shadow trades that have not yet been resolved."""
+    def open_unresolved_trades(self) -> list[dict]:
+        """
+        Trades that still need resolution against the CLOB — both SHADOW rows
+        (paper trades for validation) and LIVE rows (real money on Polymarket).
+
+        Both need their ``outcome`` + ``pnl`` columns populated so analytics
+        (``side-pnl``, ``slice-dash``, ``contrarian-pnl``) can see them as
+        "resolved". For live trades the on-chain settlement happens via
+        Polymarket's auto_redeem_operator independent of this; we just need the
+        local DB to reflect ground truth.
+
+        Excludes ``dry_run=1`` rows (legacy log-only trades the bot never
+        actually placed — nothing to resolve there).
+        """
         with sqlite3.connect(self._db) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT * FROM trades WHERE shadow=1 AND outcome IS NULL ORDER BY id"
+                "SELECT * FROM trades "
+                "WHERE outcome IS NULL "
+                "  AND (shadow=1 OR (shadow=0 AND dry_run=0)) "
+                "ORDER BY id"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # Backward-compat shim — old name still callable so external scripts /
+    # cron jobs don't break mid-deploy. New code should call
+    # ``open_unresolved_trades`` directly.
+    def open_shadow_trades(self) -> list[dict]:
+        return self.open_unresolved_trades()
 
     def shadow_stats(self) -> dict:
         """Aggregate performance stats for all resolved shadow trades."""

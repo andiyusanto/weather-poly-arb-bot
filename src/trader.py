@@ -279,16 +279,21 @@ def _compute_pnl(
     return -round(size_usdc, 4)
 
 
-def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
+def resolve_open_trades(verbose: bool = False) -> List[dict]:
     """
-    Resolve every open shadow trade against the CLOB and update the DB.
+    Resolve every open trade (shadow OR live) against the CLOB and update the DB.
+
+    Live trades settle on-chain via Polymarket's auto_redeem_operator
+    automatically; this function just brings the local DB into sync with that
+    ground truth so analytics dashboards (``side-pnl``, ``slice-dash``,
+    ``contrarian-pnl``) can see live outcomes alongside shadow ones.
 
     Returns:
         List of newly resolved trade dicts (with outcome and pnl filled in).
     """
-    open_trades = _trade_store.open_shadow_trades()
+    open_trades = _trade_store.open_unresolved_trades()
     if not open_trades:
-        logger.info("No open shadow trades to resolve.")
+        logger.info("No open trades to resolve (shadow + live).")
         return []
 
     # Many trades bet the same bucket, so resolutions are deduped by conditionId
@@ -337,8 +342,10 @@ def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
             logger.debug(f"bias record failed for trade #{trade['id']}: {e}")
 
         sign = "✅" if (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no") else "❌"
+        # Tag the log line with the actual trade type so live trades stand out.
+        kind = "LIVE" if (not trade.get("shadow") and not trade.get("dry_run")) else "Shadow"
         logger.info(
-            f"{sign} Shadow #{trade['id']} {trade.get('city')} {trade.get('bucket_label')} "
+            f"{sign} {kind} #{trade['id']} {trade.get('city')} {trade.get('bucket_label')} "
             f"[{side.upper()}] → {outcome.upper()} | P&L={fmt_usdc(pnl)}"
         )
 
@@ -351,10 +358,15 @@ def resolve_shadow_trades(verbose: bool = False) -> List[dict]:
             logger.debug(f"calibration rebuild failed: {e}")
 
     logger.success(
-        f"Resolved {len(newly_resolved)} shadow trades this run "
+        f"Resolved {len(newly_resolved)} trades this run "
         f"({still_pending} still pending finalization)."
     )
     return newly_resolved
+
+
+# Backward-compat alias so external scripts that import the old name still work.
+# Old call: ``from src.trader import resolve_shadow_trades``
+resolve_shadow_trades = resolve_open_trades
 
 
 # ── Shadow P&L report ─────────────────────────────────────────────────────────

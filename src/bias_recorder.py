@@ -2,7 +2,8 @@
 Record observed-vs-forecast errors for resolved trades so the rolling bias
 correction in ``forecast.py`` has data to work with.
 
-Called from ``trader.resolve_shadow_trades`` whenever a shadow trade resolves.
+Called from ``trader.resolve_open_trades`` whenever a trade resolves (shadow
+or live — both contribute equally valid ground truth to the bias table).
 Fetches the actual observed weather value from Open-Meteo's archive endpoint
 and stores ``observed - forecast`` per (city, model, variable, target_date).
 """

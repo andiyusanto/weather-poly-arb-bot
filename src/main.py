@@ -103,6 +103,27 @@ def _log_startup_state(mode: str) -> None:
     )
 
 
+def _mode_sql(live: bool, shadow: bool) -> tuple[str, str]:
+    """
+    Build a SQL fragment + a human label for filtering trades by execution mode.
+
+    All analytics commands share this. Default (neither flag) keeps the historical
+    behaviour: include every resolved trade regardless of mode (shadow + live + any
+    legacy dry_run rows that snuck in). When the live bot is running alongside
+    shadow data, callers pass --live to isolate the forward-validation rows.
+
+    Returns (sql_fragment, label) where sql_fragment is either '' or ' AND ...'.
+    """
+    if live and shadow:
+        # --live + --shadow is contradictory; treat as no filter (warn-style label).
+        return ("", "ALL modes (--live and --shadow both set; ignoring filter)")
+    if live:
+        return (" AND shadow=0 AND dry_run=0", "LIVE only (shadow=0, dry_run=0)")
+    if shadow:
+        return (" AND shadow=1", "SHADOW only (shadow=1)")
+    return ("", "ALL modes (shadow + live + dry_run)")
+
+
 @app.command()
 def scan(
     min_ev: float = typer.Option(settings.min_ev_threshold, "--min-ev", help="Min EV threshold (0–1)"),
@@ -350,27 +371,32 @@ def show_trades(
 
 
 @app.command()
-def resolve_shadow(
+def resolve_trades(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show status for each unresolved trade"),
 ) -> None:
     """
-    Check Gamma API for resolution of open shadow trades and update P&L.
+    Resolve every open trade (shadow + live) against the CLOB and update P&L.
 
-    Run this periodically (e.g. daily) to close out shadow positions as
-    markets resolve. Each resolved trade gets an outcome (yes/no) and a
-    computed P&L based on the ask price at entry.
+    Run this periodically (e.g. daily via cron) to close out positions as
+    markets resolve. Each resolved trade gets an ``outcome`` (yes/no) and a
+    computed ``pnl`` based on the ask price at entry. Live trades settle
+    on-chain via Polymarket's auto_redeem_operator independent of this — this
+    command just keeps the local DB in sync with that ground truth so the
+    ``side-pnl --live`` / ``contrarian-pnl --live`` dashboards have data.
+
+    Backward-compat: ``resolve-shadow`` still works and runs the same code.
     """
     setup_logging()
     _banner()
-    from src.trader import resolve_shadow_trades
+    from src.trader import resolve_open_trades
 
-    resolved = resolve_shadow_trades(verbose=verbose)
+    resolved = resolve_open_trades(verbose=verbose)
 
     if not resolved:
         console.print("[yellow]No new resolutions found.[/yellow]")
         return
 
-    console.print(f"\n[green]Resolved {len(resolved)} shadow trade(s):[/green]")
+    console.print(f"\n[green]Resolved {len(resolved)} trade(s):[/green]")
     for t in resolved:
         outcome = (t.get("outcome") or "?")
         side = (t.get("side") or "yes").lower()
@@ -383,6 +409,20 @@ def resolve_shadow(
             f"  {sign} #{t['id']} {t.get('city')} {t.get('bucket_label')} "
             f"[{side.upper()}] → {outcome.upper()} | [{color}]P&L ${pnl:.2f}[/{color}]"
         )
+
+
+@app.command(name="resolve-shadow")
+def resolve_shadow(
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show status for each unresolved trade"),
+) -> None:
+    """
+    Backward-compatibility alias for ``resolve-trades``.
+
+    Existing cron scripts that call ``python run.py resolve-shadow`` keep
+    working unchanged. The underlying logic resolves BOTH shadow and live
+    trades — same as ``resolve-trades``. New scripts should use the new name.
+    """
+    resolve_trades(verbose=verbose)
 
 
 @app.command()
@@ -408,13 +448,20 @@ def side_pnl(
     all_history: bool = typer.Option(
         False, "--all", help="Include ALL trades (overrides --since)."
     ),
+    live: bool = typer.Option(
+        False, "--live", help="Filter to LIVE rows only (shadow=0 AND dry_run=0)."
+    ),
+    shadow: bool = typer.Option(
+        False, "--shadow", help="Filter to SHADOW rows only (shadow=1)."
+    ),
 ) -> None:
     """
-    Per-side win rate, P&L, and edge-vs-breakeven for resolved shadow trades.
+    Per-side win rate, P&L, and edge-vs-breakeven for resolved trades.
 
-    Default scope is post-gate trades (id > 130). Use --all for the full history
-    or --since N to choose a different cutoff. Shows the decisive metric: whether
-    the 95% CI lower bound on win rate clears the avg ask price (= break-even).
+    Default scope is post-gate trades (id > 130) across all modes. Use --all for
+    the full history, --since N to choose a different cutoff, or --live/--shadow
+    to filter by execution mode. Shows the decisive metric: whether the 95% CI
+    lower bound on win rate clears the avg ask price (= break-even).
     """
     setup_logging()
     _banner()
@@ -429,7 +476,10 @@ def side_pnl(
         console.print("[red]--side must be 'yes', 'no', or 'both'[/red]")
         raise typer.Exit(code=1)
 
-    where = "outcome IS NOT NULL"
+    mode_sql, mode_label = _mode_sql(live, shadow)
+    console.print(f"[dim]Mode filter: {mode_label}[/dim]\n")
+
+    where = "outcome IS NOT NULL" + mode_sql
     if not all_history:
         where += f" AND id > {int(since_id)}"
     sides = ("yes", "no") if side == "both" else (side,)
@@ -442,10 +492,11 @@ def side_pnl(
                 f"FROM trades WHERE {where} AND side = ?",
                 (s,),
             ).fetchall()
+            pending_where = "outcome IS NULL" + mode_sql
+            if not all_history:
+                pending_where += f" AND id > {int(since_id)}"
             pending = conn.execute(
-                f"SELECT COUNT(*) FROM trades WHERE outcome IS NULL "
-                f"{'AND id > ' + str(int(since_id)) if not all_history else ''} "
-                f"AND side = ?",
+                f"SELECT COUNT(*) FROM trades WHERE {pending_where} AND side = ?",
                 (s,),
             ).fetchone()[0]
         n = len(rows)
@@ -523,9 +574,15 @@ def slice_dash(
     all_history: bool = typer.Option(
         False, "--all", help="Include ALL trades (overrides --since)."
     ),
+    live: bool = typer.Option(
+        False, "--live", help="Filter to LIVE rows only (shadow=0 AND dry_run=0)."
+    ),
+    shadow: bool = typer.Option(
+        False, "--shadow", help="Filter to SHADOW rows only (shadow=1)."
+    ),
 ) -> None:
     """
-    Slice resolved shadow trades by ask range, bucket type, city, lead time, and
+    Slice resolved trades by ask range, bucket type, city, lead time, and
     model_prob band — to find which patterns actually carry the edge. Read-only:
     does NOT affect trading. Run anytime; useful for spotting where edge lives
     in your post-gate sample without running CI math in your head.
@@ -543,7 +600,10 @@ def slice_dash(
         console.print("[red]--side must be 'yes' or 'no'[/red]")
         raise typer.Exit(code=1)
 
-    where = "outcome IS NOT NULL AND side = ?"
+    mode_sql, mode_label = _mode_sql(live, shadow)
+    console.print(f"[dim]Mode filter: {mode_label}[/dim]\n")
+
+    where = "outcome IS NOT NULL AND side = ?" + mode_sql
     if not all_history:
         where += f" AND id > {int(since_id)}"
 
@@ -682,6 +742,12 @@ def yes_score(
     all_history: bool = typer.Option(
         False, "--all", help="Train on ALL YES history."
     ),
+    live: bool = typer.Option(
+        False, "--live", help="Train on LIVE rows only (shadow=0 AND dry_run=0)."
+    ),
+    shadow: bool = typer.Option(
+        False, "--shadow", help="Train on SHADOW rows only (shadow=1)."
+    ),
 ) -> None:
     """
     Prototype YES-quality score — does NOT deploy or affect trading.
@@ -699,7 +765,10 @@ def yes_score(
     from rich.table import Table
     from config.settings import TRADES_DB
 
-    where = "outcome IS NOT NULL AND side = 'yes'"
+    mode_sql, mode_label = _mode_sql(live, shadow)
+    console.print(f"[dim]Mode filter: {mode_label}[/dim]\n")
+
+    where = "outcome IS NOT NULL AND side = 'yes'" + mode_sql
     if not all_history:
         where += f" AND id > {int(since_id)}"
 
@@ -848,6 +917,12 @@ def contrarian_pnl(
     since_id: int = typer.Option(
         0, "--since", help="Only include trades with id > this. Default 0 = all rows since the flag went live."
     ),
+    live: bool = typer.Option(
+        False, "--live", help="Filter to LIVE rows only (shadow=0 AND dry_run=0)."
+    ),
+    shadow: bool = typer.Option(
+        False, "--shadow", help="Filter to SHADOW rows only (shadow=1)."
+    ),
 ) -> None:
     """
     Validate the contrarian-YES-inversion strategy (Option F) against natural NO bets.
@@ -872,6 +947,9 @@ def contrarian_pnl(
     from rich.table import Table
     from config.settings import TRADES_DB
 
+    mode_sql, mode_label = _mode_sql(live, shadow)
+    console.print(f"[dim]Mode filter: {mode_label}[/dim]\n")
+
     with sqlite3.connect(TRADES_DB) as conn:
         conn.row_factory = sqlite3.Row
         # Make sure the column exists (auto-migrated on TradeStore init).
@@ -887,7 +965,7 @@ def contrarian_pnl(
             f"""SELECT id, side, contrarian, market_price, model_prob, size_usdc,
                        outcome, pnl, timestamp
                 FROM trades
-                WHERE outcome IS NOT NULL AND id > {int(since_id)}
+                WHERE outcome IS NOT NULL AND id > {int(since_id)}{mode_sql}
                 ORDER BY id"""
         ).fetchall()
         rows = [dict(r) for r in rows]
