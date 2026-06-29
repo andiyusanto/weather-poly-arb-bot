@@ -140,6 +140,7 @@ def trade(
     shadow: bool = typer.Option(False, "--shadow", help="Shadow mode: record trades for outcome tracking, no real orders"),
     once: bool = typer.Option(False, "--once", help="Run one cycle then exit (default: run on schedule)"),
     interval: int = typer.Option(settings.scan_interval_minutes, "--interval", help="Scan interval (minutes)"),
+    no_confirm: bool = typer.Option(False, "--no-confirm", "-y", help="Skip the interactive LIVE TRADING confirmation prompt (for tmux/systemd/scripted launches). Has no effect in --shadow or --dry-run."),
 ) -> None:
     """
     Auto-execute trades for high-EV opportunities.
@@ -169,9 +170,14 @@ def trade(
             console.print("[bold red]ERROR: POLY_PRIVATE_KEY / POLY_API_KEY not set. Run setup.py first.[/bold red]")
             raise typer.Exit(1)
         console.print("[bold red]⚠️  LIVE TRADING MODE[/bold red]")
-        confirm = typer.confirm("Are you sure you want to place real orders?")
-        if not confirm:
-            raise typer.Exit(0)
+        if no_confirm:
+            # Scripted / unattended launch (tmux session, systemd unit, etc).
+            # Log it so the STARTUP record makes the intent explicit.
+            logger.warning("LIVE TRADING: --no-confirm/-y flag set; skipping interactive prompt")
+        else:
+            confirm = typer.confirm("Are you sure you want to place real orders?")
+            if not confirm:
+                raise typer.Exit(0)
 
     from src.trader import run_trading_cycle
 
