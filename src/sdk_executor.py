@@ -131,6 +131,9 @@ async def sdk_place_market_order(
     token_id: str,
     side: str,
     size_usdc: float,
+    expected_quote: Optional[float] = None,
+    model_prob: Optional[float] = None,
+    min_ev: Optional[float] = None,
 ) -> Optional[Dict[str, Any]]:
     """Place a live market BUY through the deposit-wallet SDK.
 
@@ -168,6 +171,52 @@ async def sdk_place_market_order(
         logger.warning(
             f"estimate_market_price failed for {token_id} ({e}); proceeding without bump"
         )
+
+    # Pre-order slippage abort: if we have the quote that drove the trade
+    # decision and the SDK's real-time estimate is materially worse, bail
+    # before spending anything. Illiquid weather buckets routinely show
+    # 10–20¢ slippage vs the quote — those trades have negative real EV.
+    if est and est > 0 and expected_quote is not None:
+        slip = est - float(expected_quote)
+        if slip > settings.max_pre_order_slip:
+            logger.warning(
+                f"SLIP-ABORT ({side.upper()} {token_id}): quote=${expected_quote:.4f} "
+                f"est=${est:.4f} slip={slip*100:+.1f}¢ > cap {settings.max_pre_order_slip*100:.1f}¢ — skip"
+            )
+            try:
+                await client.close()
+            except Exception:
+                pass
+            return {
+                "status": "slip_abort",
+                "token_id": token_id,
+                "side": side,
+                "quote": float(expected_quote),
+                "estimate": float(est),
+                "slip_cents": round(slip * 100, 2),
+            }
+        # Also recheck EV against the estimate if we have model_prob.
+        if model_prob is not None and 0 < est < 1:
+            reprice_ev = model_prob / est - 1.0
+            floor = settings.pre_order_min_ev if min_ev is None else min_ev
+            if reprice_ev < floor:
+                logger.warning(
+                    f"SLIP-ABORT ({side.upper()} {token_id}): re-priced EV "
+                    f"{reprice_ev*100:.1f}% < floor {floor*100:.1f}% "
+                    f"(quote=${expected_quote:.4f} est=${est:.4f} prob={model_prob:.3f}) — skip"
+                )
+                try:
+                    await client.close()
+                except Exception:
+                    pass
+                return {
+                    "status": "slip_abort",
+                    "token_id": token_id,
+                    "side": side,
+                    "quote": float(expected_quote),
+                    "estimate": float(est),
+                    "reprice_ev": round(reprice_ev, 4),
+                }
 
     if est and est > 0 and float(amount) / est < MIN_SHARES:
         # Bump to clear Polymarket's minimum (+2% buffer for estimate drift).

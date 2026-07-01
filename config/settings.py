@@ -77,6 +77,37 @@ class Settings(BaseSettings):
     # SDK path. The legacy py-clob path doesn't use this (it reports raw size).
     taker_fee_pct: float = 1.25
 
+    # Slippage tax applied to the observed best-ask before EV is computed. Real
+    # FOK market fills land ~1–2¢ above the top-of-book quote (empirically
+    # measured against SDK fills; see 2026-06-29→07-01 live sample). Without a
+    # tax the bot enters marginal trades whose true EV is ~0 post-slippage. Set
+    # to 0.0 to disable. Expressed in probability units (0.02 = +2¢ on the ask).
+    slippage_tax: float = 0.02
+
+    # ── Live pre-order slippage abort (Opt 1) ───────────────────────────────
+    # Right before firing a live order, the SDK executor calls
+    # estimate_market_price and compares that estimate to the quoted ask that
+    # produced the trade decision. If the estimate exceeds the quote by more
+    # than ``max_pre_order_slip`` cents, or if EV recomputed against the
+    # estimate falls below the min-EV threshold, the order is aborted before
+    # any funds move. Empirically, illiquid weather buckets (Wuhan 30–31°C,
+    # Manila 32°C) show 11–19¢ real slippage vs the quote — those are the
+    # trades this gate catches. Set to a large value (e.g. 1.0) to disable.
+    max_pre_order_slip: float = 0.05
+    # Also require the re-computed EV to clear this threshold. Defaults to
+    # ``min_ev_threshold`` (below) — separate knob so illiquid buckets can be
+    # held to a stricter bar without changing the primary EV floor.
+    pre_order_min_ev: float = 0.20
+
+    # ── Mode-bucket NO gate (Opt 2) ─────────────────────────────────────────
+    # For a NO bet on a temperature bucket whose center sits within
+    # ``mode_bucket_c_radius`` degrees Celsius of the forecast mean, require
+    # ``model_prob`` at least this high. Blocks coin-flip mode-bucket trades
+    # where the model's ~0.60 probability is empirically ~0.40 (Wuhan 29°C,
+    # Moscow 26°C, Manila 29°C on the live tape). Set to 0.0 to disable.
+    mode_bucket_no_min_prob: float = 0.75
+    mode_bucket_c_radius: float = 1.0
+
     # ── Telegram ────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""

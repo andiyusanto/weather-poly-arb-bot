@@ -67,6 +67,27 @@ class Opportunity:
 
 # ── EV / Kelly core ───────────────────────────────────────────────────────────
 
+_BUCKET_NUM_RE = None
+
+
+def _bucket_center_c(label: str) -> Optional[float]:
+    """Extract the first numeric value from a Polymarket temperature bucket label.
+
+    Handles the two live shapes we see: exact-value buckets like ``"29°C"`` and
+    open-ended tail buckets like ``"39°C or higher"``. Returns None if the
+    label doesn't contain a parseable number (defensive — we skip the gate
+    rather than crash on a new market type).
+    """
+    global _BUCKET_NUM_RE
+    if _BUCKET_NUM_RE is None:
+        import re
+        _BUCKET_NUM_RE = re.compile(r"(-?\d+(?:\.\d+)?)")
+    if not label:
+        return None
+    m = _BUCKET_NUM_RE.search(label)
+    return float(m.group(1)) if m else None
+
+
 def compute_ev(model_prob: float, ask_price: float) -> float:
     if ask_price <= 0 or ask_price >= 1:
         return -1.0
@@ -203,17 +224,23 @@ def evaluate_market(
         p_yes = calibrate_probability(raw_p_yes, market.market_type.value)
         p_no = 1.0 - p_yes
 
+        # Slippage tax: FOK market orders empirically fill ~1–2¢ above the
+        # top-of-book quote. Inflating the ask here filters marginal edges
+        # whose true post-fill EV is negative, without touching the winning
+        # tail where the model has genuine multi-cent edge.
+        slip = max(0.0, settings.slippage_tax)
+
         # ── YES side ──
         ask_yes = bucket.best_ask
         ev_yes = -1.0
         if min_ask <= ask_yes <= max_ask:
-            ev_yes = compute_ev(p_yes, ask_yes)
+            ev_yes = compute_ev(p_yes, min(ask_yes + slip, max_ask))
 
         # ── NO side ──
         ask_no = bucket.no_ask
         ev_no = -1.0
         if min_ask <= ask_no <= max_ask:
-            ev_no = compute_ev(p_no, ask_no)
+            ev_no = compute_ev(p_no, min(ask_no + slip, max_ask))
 
         # Pick the better side, if any.
         if ev_yes >= ev_no:
@@ -225,6 +252,33 @@ def evaluate_market(
 
         if side_ev < min_ev:
             continue
+
+        # Mode-bucket NO gate: the bucket whose center sits closest to the
+        # forecast mean is exactly where the model's ~0.60 probability is
+        # empirically a coin flip (true wr ≈ 40%). Betting NO there loses
+        # asymmetrically because we're wrong on the most-likely outcome.
+        # Live-trade retro (2026-06-29 → 07-01): filter would have blocked
+        # 3 of 5 realized losses (Wuhan 29°C, Moscow 26°C, Manila 29°C).
+        # Only apply to temperature — precip/snow already zero-inflated.
+        if (
+            side == "no"
+            and market.market_type.value == "temperature"
+            and settings.mode_bucket_no_min_prob > 0
+        ):
+            bucket_c = _bucket_center_c(bucket.outcome_label)
+            if bucket_c is not None:
+                # forecast.mean_f is Fahrenheit for temperature; convert to °C.
+                fm_c = (float(forecast.mean_f) - 32.0) * 5.0 / 9.0
+                if (
+                    abs(bucket_c - fm_c) < settings.mode_bucket_c_radius
+                    and side_prob < settings.mode_bucket_no_min_prob
+                ):
+                    logger.info(
+                        f"  [temperature] {market.city} {bucket.outcome_label} NO: "
+                        f"mode-bucket (center {bucket_c:.1f}°C, forecast {fm_c:.1f}°C) "
+                        f"prob {side_prob:.2f} < {settings.mode_bucket_no_min_prob:.2f} — skipped"
+                    )
+                    continue
 
         # Confidence floor on the side we're actually betting. EV-only triggering
         # buys cheap longshots whose tiny probabilities are tail-noise (and where

@@ -834,6 +834,9 @@ def place_market_order(
     side: str,
     size_usdc: float,
     dry_run: bool = True,
+    expected_quote: Optional[float] = None,
+    model_prob: Optional[float] = None,
+    min_ev: Optional[float] = None,
 ) -> Optional[Dict]:
     """
     Place a market BUY for the given token. To buy YES on a bucket, pass the
@@ -861,7 +864,12 @@ def place_market_order(
         import asyncio
         from src.sdk_executor import sdk_place_market_order
         try:
-            return asyncio.run(sdk_place_market_order(token_id, side, size_usdc))
+            return asyncio.run(sdk_place_market_order(
+                token_id, side, size_usdc,
+                expected_quote=expected_quote,
+                model_prob=model_prob,
+                min_ev=min_ev,
+            ))
         except Exception as e:
             logger.error(f"SDK execution failed (token={token_id}, side={side}): {e}")
             return {"status": "error", "error": str(e), "path": "sdk"}

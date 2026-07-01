@@ -144,8 +144,41 @@ def execute_opportunity(
             side=opp.side.upper(),
             size_usdc=opp.suggested_size_usdc,
             dry_run=False,
+            # Give the SDK executor the quote+prob it needs to run the
+            # pre-order slippage abort (Opt 1). If the real-time estimate
+            # is materially worse than what the strategy priced against,
+            # the order is skipped before any funds move.
+            expected_quote=opp.market_price,
+            model_prob=opp.model_prob,
+            min_ev=settings.pre_order_min_ev,
         )
         mode = "live"
+
+        # A pre-order slippage abort is not a placed trade; don't persist a
+        # trade row for it, don't alert as a fill. Log-and-return keeps the
+        # trading loop clean.
+        if isinstance(result, dict) and result.get("status") == "slip_abort":
+            logger.info(
+                f"[SLIP-ABORT] {opp.market.city} {opp.bucket.outcome_label} {opp.side.upper()} "
+                f"quote={fmt_pct(opp.market_price)} est={fmt_pct(result.get('estimate') or 0)} "
+                f"slip={result.get('slip_cents')}¢"
+            )
+            return result
+
+    # Prefer the actual SDK fill over the pre-order quote so downstream P&L,
+    # calibration, and analytics train on ground truth. sdk_executor returns
+    # ``fill_price`` (post-fee entry) and ``size_usdc`` (post-fee spend, incl.
+    # the min-share bump). Fall back to the pre-order values on shadow / dry
+    # runs and on the legacy py-clob path (which doesn't report a fill price).
+    recorded_price = opp.market_price
+    recorded_size = opp.suggested_size_usdc
+    if mode == "live" and isinstance(result, dict) and result.get("status") == "placed":
+        fp = result.get("fill_price")
+        rs = result.get("size_usdc")
+        if fp and fp > 0:
+            recorded_price = float(fp)
+        if rs and rs > 0:
+            recorded_size = float(rs)
 
     forecast_mean = getattr(opp.forecast, "mean_f", None)
     trade_record = dict(
@@ -157,10 +190,10 @@ def execute_opportunity(
         target_date=opp.market.target_date.isoformat() if opp.market.target_date else "",
         bucket_label=opp.bucket.outcome_label,
         model_prob=opp.model_prob,
-        market_price=opp.market_price,
+        market_price=recorded_price,
         ev=opp.ev,
         confidence=opp.confidence,
-        size_usdc=opp.suggested_size_usdc,
+        size_usdc=recorded_size,
         side=opp.side,
         forecast_mean=forecast_mean,
         dry_run=int((dry_run or settings.dry_run) and not shadow),
@@ -174,7 +207,9 @@ def execute_opportunity(
 
     logger.info(
         f"[{mode.upper()}] {opp.market.city} {opp.bucket.outcome_label} | "
-        f"EV={fmt_pct(opp.ev)} conf={fmt_pct(opp.confidence)} size={fmt_usdc(opp.suggested_size_usdc)}"
+        f"EV={fmt_pct(opp.ev)} conf={fmt_pct(opp.confidence)} "
+        f"quote={fmt_pct(opp.market_price)} fill={fmt_pct(recorded_price)} "
+        f"size={fmt_usdc(recorded_size)}"
     )
     return result
 
