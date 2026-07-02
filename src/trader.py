@@ -158,10 +158,18 @@ def execute_opportunity(
         # trade row for it, don't alert as a fill. Log-and-return keeps the
         # trading loop clean.
         if isinstance(result, dict) and result.get("status") == "slip_abort":
+            # slip_cents is only populated on the raw-cents branch; the
+            # reprice-EV branch reports reprice_ev instead. Compute a display
+            # value from whichever we have so the log line is always readable.
+            est = result.get("estimate") or 0.0
+            slip_c = result.get("slip_cents")
+            if slip_c is None and est:
+                slip_c = round((est - opp.market_price) * 100, 1)
+            rev = result.get("reprice_ev")
+            extra = f" reprice_ev={rev*100:.1f}%" if rev is not None else ""
             logger.info(
                 f"[SLIP-ABORT] {opp.market.city} {opp.bucket.outcome_label} {opp.side.upper()} "
-                f"quote={fmt_pct(opp.market_price)} est={fmt_pct(result.get('estimate') or 0)} "
-                f"slip={result.get('slip_cents')}¢"
+                f"quote={fmt_pct(opp.market_price)} est={fmt_pct(est)} slip={slip_c:+.1f}¢{extra}"
             )
             return result
 
