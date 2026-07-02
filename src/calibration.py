@@ -92,7 +92,24 @@ def calibrate_probability(raw_prob: float, market_type: str) -> float:
     """
     Apply the empirical calibration curve for this market_type. Returns the
     raw probability unchanged if no curve has been fit yet.
+
+    When ``settings.use_raw_calibration`` is true, the isotonic curve is
+    bypassed entirely in favor of a linear overconfidence haircut that
+    preserves bucket ordering. See settings docstring for the rationale
+    (2026-07-02 diagnosis: isotonic curve was fit on biased mode-bucket-only
+    training samples, collapsing raw YES probs 0–0.78 to a flat 0.383).
     """
+    p = max(0.0, min(1.0, float(raw_prob)))
+
+    # Raw-KDE bypass path: pull ``p`` a fraction ``haircut`` toward 0.5.
+    # haircut=1.0 → identity, haircut=0.0 → always 0.5. Default 0.7 gives a
+    # 30% linear correction that mirrors the "ensembles are ~2x overconfident
+    # at the tails" prior without flattening bucket-level ranking.
+    from config.settings import settings
+    if settings.use_raw_calibration:
+        h = max(0.0, min(1.0, settings.calibration_haircut))
+        return 0.5 + h * (p - 0.5)
+
     with _cache_lock:
         curve = _curve_cache.get(market_type)
     if curve is None:
@@ -100,14 +117,13 @@ def calibrate_probability(raw_prob: float, market_type: str) -> float:
         with _cache_lock:
             _curve_cache[market_type] = curve
     if not curve:
-        return float(raw_prob)
+        return p
 
     edges, rates = curve
     if not edges or not rates:
-        return float(raw_prob)
+        return p
 
     # Locate the bin and return its empirical rate.
-    p = max(0.0, min(1.0, float(raw_prob)))
     for i, edge in enumerate(edges):
         if p <= edge:
             return float(rates[i])

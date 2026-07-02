@@ -108,6 +108,18 @@ class Settings(BaseSettings):
     mode_bucket_no_min_prob: float = 0.75
     mode_bucket_c_radius: float = 1.0
 
+    # ── Raw-KDE bypass (Fix 1 — calibration curve corrupted 2026-07-02) ─────
+    # The isotonic calibration curve for temperature was fit on ~1610 shadow
+    # trades all drawn from a mode-bucket-picking policy, so it collapses raw
+    # YES probs 0–0.78 to a flat 0.383 and destroys bucket-level ranking.
+    # When ``use_raw_calibration`` is true, ``calibrate_probability`` skips
+    # the isotonic lookup and instead pulls the raw KDE prob a fraction
+    # ``calibration_haircut`` toward 0.5 (a linear overconfidence correction
+    # that preserves bucket ordering — mode still ranks highest, tails still
+    # rank lowest). Set false to fall back to the SQLite isotonic curve.
+    use_raw_calibration: bool = True
+    calibration_haircut: float = 0.7
+
     # ── Telegram ────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
