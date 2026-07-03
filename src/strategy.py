@@ -253,6 +253,16 @@ def evaluate_market(
         if side_ev < min_ev:
             continue
 
+        # Filter A — NO-side ask ceiling. Even at 67% observed win-rate,
+        # buying NO above ~80¢ pays 15¢ or less on win vs 80¢+ downside;
+        # aggregate P&L on the allowlist shadow tape (n=18) was −$0.25/trade.
+        if side == "no" and side_ask > settings.max_no_ask:
+            logger.debug(
+                f"  [{market.market_type.value}] {market.city} {bucket.outcome_label} NO: "
+                f"ask {side_ask:.2f} > cap {settings.max_no_ask:.2f} — skipped"
+            )
+            continue
+
         # Mode-bucket NO gate: the bucket whose center sits closest to the
         # forecast mean is exactly where the model's ~0.60 probability is
         # empirically a coin flip (true wr ≈ 40%). Betting NO there loses

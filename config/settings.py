@@ -120,6 +120,13 @@ class Settings(BaseSettings):
     use_raw_calibration: bool = True
     calibration_haircut: float = 0.7
 
+    # ── Filter A: NO-side ask ceiling ───────────────────────────────────────
+    # Shadow tape (allowlist, n=18 at 0.75–0.90 NO ask): even at 67% win rate,
+    # the 15¢-reward-for-85¢-risk payoff loses money in aggregate (−$0.25 per
+    # trade). Skip any NO bet where the ask exceeds this cap regardless of
+    # model_prob. Set to 1.0 to disable.
+    max_no_ask: float = 0.80
+
     # ── Telegram ────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
