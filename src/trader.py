@@ -402,11 +402,74 @@ def resolve_open_trades(verbose: bool = False) -> List[dict]:
         except Exception as e:
             logger.debug(f"calibration rebuild failed: {e}")
 
+    # Consecutive-loss Telegram alert. Only fires when THIS batch just added a
+    # fresh live loss AND the running live-loss streak has reached the
+    # configured threshold — the "fresh loss" gate is what prevents cron-repeat
+    # spam (streak stays high across many empty cron runs until a win lands).
+    threshold = int(settings.consecutive_loss_alert or 0)
+    if threshold > 0 and newly_resolved:
+        new_live_loss = any(
+            (t.get("pnl") or 0) < 0
+            and not t.get("shadow")
+            and not t.get("dry_run")
+            for t in newly_resolved
+        )
+        if new_live_loss:
+            streak, last_losses = _live_loss_streak()
+            if streak >= threshold:
+                send_telegram(_consecutive_loss_alert(streak, threshold, last_losses))
+                logger.warning(
+                    f"⚠️ Live loss streak = {streak} (≥ {threshold}) — Telegram alert sent"
+                )
+
     logger.success(
         f"Resolved {len(newly_resolved)} trades this run "
         f"({still_pending} still pending finalization)."
     )
     return newly_resolved
+
+
+def _live_loss_streak() -> tuple[int, list[dict]]:
+    """Count consecutive losses in the most-recent resolved LIVE trades.
+
+    Walks trades newest → oldest and counts contiguous losses until the first
+    win (or a non-live trade) breaks the run. Returns the streak length and
+    the streak's trades themselves for the alert body.
+    """
+    streak = 0
+    losses: list[dict] = []
+    for t in _trade_store.recent_trades(n=50):
+        if t.get("shadow") or t.get("dry_run"):
+            continue
+        if t.get("outcome") is None:
+            # Still open — doesn't break the streak but doesn't extend it either.
+            continue
+        if (t.get("pnl") or 0) < 0:
+            streak += 1
+            losses.append(t)
+        else:
+            break
+    return streak, losses
+
+
+def _consecutive_loss_alert(streak: int, threshold: int, losses: list[dict]) -> str:
+    """Compose a Telegram body listing the streak and the individual losers."""
+    lines = [
+        f"⚠️ *LIVE LOSS STREAK: {streak}* (threshold {threshold})",
+        "",
+        "Most recent losses (newest first):",
+    ]
+    for t in losses[:5]:
+        lines.append(
+            f"  • #{t['id']} {t.get('city','?')} {t.get('bucket_label','?')} "
+            f"{(t.get('side') or '').upper()} → {t.get('outcome','?').upper()}  "
+            f"P&L=${(t.get('pnl') or 0):+.2f}"
+        )
+    if streak > 5:
+        lines.append(f"  … and {streak - 5} more.")
+    lines.append("")
+    lines.append("Consider pausing the bot for review.")
+    return "\n".join(lines)
 
 
 # Backward-compat alias so external scripts that import the old name still work.

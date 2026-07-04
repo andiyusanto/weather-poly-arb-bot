@@ -127,6 +127,13 @@ class Settings(BaseSettings):
     # model_prob. Set to 1.0 to disable.
     max_no_ask: float = 0.80
 
+    # ── Consecutive-loss Telegram alert ─────────────────────────────────────
+    # When the most recent ``consecutive_loss_alert`` LIVE trades all lost,
+    # send a Telegram message on the next resolution cycle that includes at
+    # least one new loss. Prevents spamming on repeat cron runs because the
+    # check only fires when a fresh loss lands. Set to 0 to disable.
+    consecutive_loss_alert: int = 3
+
     # ── Telegram ────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
