@@ -388,11 +388,20 @@ def resolve_open_trades(verbose: bool = False) -> List[dict]:
 
         sign = "✅" if (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no") else "❌"
         # Tag the log line with the actual trade type so live trades stand out.
-        kind = "LIVE" if (not trade.get("shadow") and not trade.get("dry_run")) else "Shadow"
+        is_live = not trade.get("shadow") and not trade.get("dry_run")
+        kind = "LIVE" if is_live else "Shadow"
         logger.info(
             f"{sign} {kind} #{trade['id']} {trade.get('city')} {trade.get('bucket_label')} "
             f"[{side.upper()}] → {outcome.upper()} | P&L={fmt_usdc(pnl)}"
         )
+
+        # Per-resolution Telegram — live trades only, gated by settings flag.
+        # Keeps capital drift visible without opening the DB.
+        if is_live and settings.notify_every_resolution and settings.has_telegram:
+            try:
+                send_telegram(_per_resolution_alert(trade, side, outcome, pnl))
+            except Exception as e:
+                logger.debug(f"per-resolution telegram failed: {e}")
 
     # Refresh empirical calibration after a batch of resolutions.
     if newly_resolved:
@@ -470,6 +479,34 @@ def _consecutive_loss_alert(streak: int, threshold: int, losses: list[dict]) -> 
     lines.append("")
     lines.append("Consider pausing the bot for review.")
     return "\n".join(lines)
+
+
+def _per_resolution_alert(trade: dict, side: str, outcome: str, pnl: float) -> str:
+    """Short Telegram body for one resolved live trade with running live P&L.
+
+    Running total lets the user eyeball capital drift without opening the DB.
+    """
+    is_win = (side == "yes" and outcome == "yes") or (side == "no" and outcome == "no")
+    header = "✅ *WIN*" if is_win else "❌ *LOSS*"
+
+    running = 0.0
+    n_resolved = 0
+    for t in _trade_store.recent_trades(n=200):
+        if t.get("shadow") or t.get("dry_run"):
+            continue
+        if t.get("outcome") is None:
+            continue
+        running += float(t.get("pnl") or 0.0)
+        n_resolved += 1
+
+    size = float(trade.get("size_usdc") or 0.0)
+    ask = float(trade.get("market_price") or 0.0)
+    return (
+        f"{header}  #{trade['id']}  {trade.get('city','?')} {trade.get('bucket_label','?')}\n"
+        f"side={side.upper()} → outcome={outcome.upper()}\n"
+        f"stake=${size:.2f} @ ask={ask:.3f}  P&L=${pnl:+.2f}\n"
+        f"running live P&L (n={n_resolved}) = ${running:+.2f}"
+    )
 
 
 # Backward-compat alias so external scripts that import the old name still work.

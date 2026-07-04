@@ -134,6 +134,11 @@ class Settings(BaseSettings):
     # check only fires when a fresh loss lands. Set to 0 to disable.
     consecutive_loss_alert: int = 3
 
+    # Fire a Telegram alert for every resolved LIVE trade (win or loss). Body
+    # includes side, outcome, P&L, and running live-P&L total so capital drift
+    # is visible without opening the DB. Independent of consecutive_loss_alert.
+    notify_every_resolution: bool = True
+
     # ── Telegram ────────────────────────────────────────────────────────────
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
