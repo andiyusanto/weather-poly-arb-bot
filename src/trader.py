@@ -268,6 +268,30 @@ def run_trading_cycle(
     if n_dup:
         logger.info(f"Skipped {n_dup} already-traded buckets (one bet per bucket)")
 
+    # Per-city daily cap — prevents concentration on a single city when the
+    # scanner surfaces multiple correlated buckets in one pass. Applied before
+    # the USDC quota so refused trades don't eat the daily budget.
+    city_cap = int(settings.max_trades_per_city_per_day or 0)
+    if city_cap > 0:
+        already_by_city = _trade_store.trades_today_by_city()
+        session_by_city: dict[str, int] = {}
+        after_city_filter: List[Opportunity] = []
+        for opp in fresh:
+            city = opp.market.city or ""
+            already = already_by_city.get(city, 0) + session_by_city.get(city, 0)
+            if already >= city_cap:
+                logger.info(
+                    f"  [{opp.market.market_type.value}] {city} {opp.bucket.outcome_label} "
+                    f"{opp.side.upper()}: per-city cap {city_cap} reached — skipped"
+                )
+                continue
+            session_by_city[city] = session_by_city.get(city, 0) + 1
+            after_city_filter.append(opp)
+        n_capped = len(fresh) - len(after_city_filter)
+        if n_capped:
+            logger.info(f"Per-city cap dropped {n_capped} opportunities")
+        fresh = after_city_filter
+
     already_spent = _trade_store.today_spent()
     actionable = apply_daily_limit(
         fresh[:top_n],

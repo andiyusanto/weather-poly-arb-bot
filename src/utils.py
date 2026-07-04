@@ -239,6 +239,18 @@ class TradeStore:
             ).fetchone()
         return float(row[0])
 
+    def trades_today_by_city(self) -> dict[str, int]:
+        """Count of LIVE trades placed today, grouped by city."""
+        today = now_utc().date().isoformat()
+        with sqlite3.connect(self._db) as conn:
+            rows = conn.execute(
+                "SELECT city, COUNT(*) FROM trades "
+                "WHERE DATE(timestamp)=? AND dry_run=0 AND shadow=0 "
+                "GROUP BY city",
+                (today,),
+            ).fetchall()
+        return {r[0] or "": int(r[1]) for r in rows}
+
     def recent_trades(self, n: int = 100) -> list[dict]:
         with sqlite3.connect(self._db) as conn:
             conn.row_factory = sqlite3.Row

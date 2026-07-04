@@ -149,6 +149,13 @@ class Settings(BaseSettings):
     kelly_fraction: float = 0.25
     max_trade_usdc: float = 50.0
     daily_max_usdc: float = 500.0
+
+    # Per-city per-day trade cap. Prevents concentration when the scanner
+    # surfaces the same city 3× in one pass (e.g. multiple bucket edges on
+    # Chengdu — outcomes are correlated by the underlying weather draw).
+    # Counts LIVE trades only; shadow/dry-run don't consume quota.
+    # Set to 0 to disable the cap entirely.
+    max_trades_per_city_per_day: int = 2
     min_confidence: float = 0.55
     # Minimum probability for the side we bet. EV alone will buy 3¢ longshots on
     # model_prob a few % above the ask — exactly where the KDE tail is unreliable
