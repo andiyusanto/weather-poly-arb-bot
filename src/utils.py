@@ -267,10 +267,17 @@ class TradeStore:
             )
             conn.commit()
 
-    def traded_bucket_keys(self) -> set[tuple]:
+    def traded_bucket_keys(self, shadow: bool | None = None) -> set[tuple]:
         """
         Return the set of (city, target_date, bucket_label, side, contrarian) already
         traded.
+
+        Args:
+            shadow: If given, restrict to shadow rows (True) or non-shadow rows
+                (False). None (default) keeps the historical behavior of one
+                shared namespace. Live and parallel-shadow dedup MUST use
+                separate namespaces — otherwise a shadow record of a
+                budget-skipped opportunity would block the real trade next cycle.
 
         Used to enforce one bet per (bucket, strategy) across cycles: the trader
         re-scans every interval, so without this guard the same bucket is re-entered
@@ -288,7 +295,12 @@ class TradeStore:
             has_contrarian = "contrarian" in cols
             sel = "city, target_date, bucket_label, side"
             sel += ", contrarian" if has_contrarian else ""
-            rows = conn.execute(f"SELECT {sel} FROM trades").fetchall()
+            where = ""
+            params: tuple = ()
+            if shadow is not None:
+                where = " WHERE shadow=?"
+                params = (int(shadow),)
+            rows = conn.execute(f"SELECT {sel} FROM trades{where}", params).fetchall()
         return {
             (
                 (r[0] or ""),

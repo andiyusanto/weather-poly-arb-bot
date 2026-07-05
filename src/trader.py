@@ -109,6 +109,7 @@ def execute_opportunity(
     opp: Opportunity,
     dry_run: bool = True,
     shadow: bool = False,
+    quiet: bool = False,
 ) -> Optional[dict]:
     """
     Place or simulate an order and record to the DB.
@@ -118,6 +119,8 @@ def execute_opportunity(
         dry_run: If True, skip order submission (no DB record for outcomes).
         shadow: If True, skip order submission but record to DB for outcome tracking.
                 Mutually exclusive with dry_run=False.
+        quiet: If True, skip the per-trade Telegram alert (used by the
+               parallel-shadow control recorder to avoid spamming).
 
     Returns:
         Order result dict with status key.
@@ -210,8 +213,9 @@ def execute_opportunity(
     )
     _trade_store.record(trade_record)
 
-    alert = _opportunity_alert(opp, mode=mode)
-    send_telegram(alert)
+    if not quiet:
+        alert = _opportunity_alert(opp, mode=mode)
+        send_telegram(alert)
 
     logger.info(
         f"[{mode.upper()}] {opp.market.city} {opp.bucket.outcome_label} | "
@@ -253,7 +257,9 @@ def run_trading_cycle(
     # Drop buckets we've already bet (any prior cycle/day). The scan re-discovers
     # the same buckets every interval; without this we re-enter the same position
     # each cycle, biasing the shadow sample and over-concentrating live capital.
-    traded = _trade_store.traded_bucket_keys()
+    # Live/dry and shadow use separate dedup namespaces: parallel-shadow rows
+    # must never block a real trade on the same bucket (and vice versa).
+    traded = _trade_store.traded_bucket_keys(shadow=shadow if mode != "live" else False)
     def _key(opp: Opportunity) -> tuple:
         td = opp.market.target_date.isoformat() if opp.market.target_date else ""
         return (
@@ -291,6 +297,26 @@ def run_trading_cycle(
         if n_capped:
             logger.info(f"Per-city cap dropped {n_capped} opportunities")
         fresh = after_city_filter
+
+    # Parallel shadow control group: in live mode, record EVERY qualified
+    # opportunity as a shadow row too — including those later dropped by the
+    # city cap or daily budget. The shadow tape then measures the model at
+    # quoted prices while live measures model + execution; the gap is the true
+    # slippage/fee cost. Separate dedup namespace (shadow=True). Runs before
+    # the daily-limit early-return so no-trade cycles still build the control.
+    if mode == "live" and settings.parallel_shadow:
+        shadow_seen = _trade_store.traded_bucket_keys(shadow=True)
+        n_shadowed = 0
+        for opp in result.opportunities:
+            if _key(opp) in shadow_seen:
+                continue
+            try:
+                execute_opportunity(opp, dry_run=False, shadow=True, quiet=True)
+                n_shadowed += 1
+            except Exception as e:
+                logger.warning(f"parallel-shadow record failed for {opp.summary()}: {e}")
+        if n_shadowed:
+            logger.info(f"Parallel shadow: recorded {n_shadowed} control trades")
 
     already_spent = _trade_store.today_spent()
     actionable = apply_daily_limit(

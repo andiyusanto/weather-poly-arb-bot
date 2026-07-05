@@ -127,6 +127,24 @@ class Settings(BaseSettings):
     # model_prob. Set to 1.0 to disable.
     max_no_ask: float = 0.80
 
+    # ── NO-side ask floor ────────────────────────────────────────────────────
+    # June shadow tape (allowlist-6, dedup n=302): the profitable band is NO
+    # ask 0.50–0.80 (+6.1% ROI); live trades below 0.50 ran 30% WR / −20% ROI.
+    # Skip NO bets cheaper than this. Set to 0.0 to disable.
+    min_no_ask: float = 0.0
+
+    # ── NO-only mode ─────────────────────────────────────────────────────────
+    # Skip YES candidates entirely. Shadow YES is 35% WR lottery-ticket noise
+    # (n=20) and live YES ran −11% ROI; all measured edge is on the NO side.
+    no_side_only: bool = False
+
+    # ── Parallel shadow control group ────────────────────────────────────────
+    # In LIVE mode, also record every qualified opportunity as a shadow trade
+    # (no order placed). Gives a same-period control tape so execution cost
+    # (slippage/fees) can be separated from model decay. Shadow rows use their
+    # own dedup namespace and never consume live quota.
+    parallel_shadow: bool = True
+
     # ── Consecutive-loss Telegram alert ─────────────────────────────────────
     # When the most recent ``consecutive_loss_alert`` LIVE trades all lost,
     # send a Telegram message on the next resolution cycle that includes at

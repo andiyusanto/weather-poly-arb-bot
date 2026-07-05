@@ -233,7 +233,7 @@ def evaluate_market(
         # ── YES side ──
         ask_yes = bucket.best_ask
         ev_yes = -1.0
-        if min_ask <= ask_yes <= max_ask:
+        if not settings.no_side_only and min_ask <= ask_yes <= max_ask:
             ev_yes = compute_ev(p_yes, min(ask_yes + slip, max_ask))
 
         # ── NO side ──
@@ -256,10 +256,11 @@ def evaluate_market(
         # Filter A — NO-side ask ceiling. Even at 67% observed win-rate,
         # buying NO above ~80¢ pays 15¢ or less on win vs 80¢+ downside;
         # aggregate P&L on the allowlist shadow tape (n=18) was −$0.25/trade.
-        if side == "no" and side_ask > settings.max_no_ask:
+        if side == "no" and not (settings.min_no_ask <= side_ask <= settings.max_no_ask):
             logger.debug(
                 f"  [{market.market_type.value}] {market.city} {bucket.outcome_label} NO: "
-                f"ask {side_ask:.2f} > cap {settings.max_no_ask:.2f} — skipped"
+                f"ask {side_ask:.2f} outside "
+                f"[{settings.min_no_ask:.2f}, {settings.max_no_ask:.2f}] — skipped"
             )
             continue
 
