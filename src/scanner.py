@@ -215,6 +215,16 @@ def run_scan(
                 f"City allowlist (n={len(allow)}): dropped {dropped} markets, kept {len(active_markets)}"
             )
 
+    block = settings.city_blacklist_set
+    if block:
+        before = len(active_markets)
+        active_markets = [m for m in active_markets if (m.city or "").strip().lower() not in block]
+        dropped = before - len(active_markets)
+        if dropped:
+            logger.info(
+                f"City blacklist (n={len(block)}): dropped {dropped} markets, kept {len(active_markets)}"
+            )
+
     # Liquidity filter — drop buckets below the volume floor. Precip/snow
     # buckets often sit at ~$0 of 24h volume; trading those is a coin flip.
     min_vol = settings.min_bucket_volume_usdc

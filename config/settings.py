@@ -184,6 +184,9 @@ class Settings(BaseSettings):
     # Match is case-insensitive and trimmed. Example .env line:
     #   CITY_ALLOWLIST=Mexico City,Wuhan,Guangzhou,Moscow,Jeddah,Manila,Chengdu
     city_allowlist: str = ""
+    # Case-insensitive comma-separated list of cities to EXCLUDE (applied after
+    # allowlist). Use to quarantine bleeding cities without editing allowlist.
+    city_blacklist: str = ""
     # Open-Meteo ensemble horizon is 16 days. Cap at 15d so every market we
     # surface has at least one valid forecast member.
     max_hours_to_resolution: float = 360.0
@@ -254,6 +257,11 @@ class Settings(BaseSettings):
         Used by scanner.run_scan to drop markets early, saving Open-Meteo quota.
         """
         return {c.strip().lower() for c in self.city_allowlist.split(",") if c.strip()}
+
+    @property
+    def city_blacklist_set(self) -> set:
+        """Lower-cased set of blocked cities; empty set means 'no block'."""
+        return {c.strip().lower() for c in self.city_blacklist.split(",") if c.strip()}
 
     @property
     def has_telegram(self) -> bool:
