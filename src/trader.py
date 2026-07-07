@@ -176,6 +176,26 @@ def execute_opportunity(
             )
             return result
 
+        # Any live result that is not an actual fill (error / rejected / FOK
+        # killed / unexpected shape) must NOT be persisted: recording it would
+        # create a phantom position that later "resolves" and corrupts the
+        # live P&L tape (this happened twice: a killed FOK and an
+        # insufficient-balance reject were both recorded as wins).
+        if not (isinstance(result, dict) and result.get("status") == "placed"):
+            kind = result.get("kind") or result.get("status", "?") if isinstance(result, dict) else "?"
+            err = result.get("error", "no detail") if isinstance(result, dict) else repr(result)
+            logger.error(
+                f"[ORDER-FAILED] {opp.market.city} {opp.bucket.outcome_label} {opp.side.upper()} "
+                f"size={fmt_usdc(opp.suggested_size_usdc)} kind={kind}: {err} — trade NOT recorded"
+            )
+            if not quiet:
+                send_telegram(
+                    f"❌ LIVE order failed ({kind})\n"
+                    f"{opp.market.city} {opp.bucket.outcome_label} {opp.side.upper()} "
+                    f"size={fmt_usdc(opp.suggested_size_usdc)}\n{err}"
+                )
+            return result
+
     # Prefer the actual SDK fill over the pre-order quote so downstream P&L,
     # calibration, and analytics train on ground truth. sdk_executor returns
     # ``fill_price`` (post-fee entry) and ``size_usdc`` (post-fee spend, incl.
