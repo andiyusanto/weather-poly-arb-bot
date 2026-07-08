@@ -351,11 +351,16 @@ def refresh_unresolved(conn: sqlite3.Connection, cap: int = 500) -> None:
     print(f"  resolved {n_fixed}/{len(rows)} on retry")
 
 
-def _fetch_one_price_series(token_id: str) -> tuple[str, str, list]:
-    """Worker: one token's full-life hourly price series."""
+def _fetch_one_price_series(token_id: str, end_ts: int) -> tuple[str, str, list]:
+    """Worker: one token's hourly price series over its final week.
+
+    interval=max returns nothing for markets older than ~1 month; explicit
+    startTs/endTs anchored on the market's end date works for all ages.
+    """
     try:
         data = _get_json(_thread_session(), f"{CLOB}/prices-history",
-                         {"market": token_id, "interval": "max",
+                         {"market": token_id,
+                          "startTs": end_ts - 7 * 86400, "endTs": end_ts,
                           "fidelity": PRICE_FIDELITY_MIN})
         pts = data.get("history", []) or []
         return token_id, ("ok" if pts else "empty"), pts
@@ -365,11 +370,18 @@ def _fetch_one_price_series(token_id: str) -> tuple[str, str, list]:
 
 def fetch_prices(conn: sqlite3.Connection, max_tokens: Optional[int]) -> None:
     """Phase 2: hourly YES-price series for every bucket not yet fetched."""
-    todo = [r[0] for r in conn.execute(
-        """SELECT b.yes_token_id FROM hist_buckets b
+    todo = []
+    for token_id, end_date in conn.execute(
+        """SELECT b.yes_token_id, b.end_date FROM hist_buckets b
            LEFT JOIN hist_price_status s ON s.token_id = b.yes_token_id
-           WHERE b.yes_token_id != '' AND b.winner IS NOT NULL AND s.token_id IS NULL
-           ORDER BY b.end_date DESC""")]
+           WHERE b.yes_token_id != '' AND b.winner IS NOT NULL AND b.end_date IS NOT NULL
+             AND s.token_id IS NULL
+           ORDER BY b.end_date DESC"""):
+        try:
+            end_ts = int(datetime.fromisoformat(end_date).timestamp())
+        except ValueError:
+            continue
+        todo.append((token_id, end_ts))
     if max_tokens:
         todo = todo[:max_tokens]
     print(f"Phase 2: {len(todo)} price series to fetch "
@@ -377,7 +389,7 @@ def fetch_prices(conn: sqlite3.Connection, max_tokens: Optional[int]) -> None:
 
     n_done = 0
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        futures = {pool.submit(_fetch_one_price_series, t): t for t in todo}
+        futures = {pool.submit(_fetch_one_price_series, t, ts): t for t, ts in todo}
         for fut in as_completed(futures):
             token_id, status, pts = fut.result()
             if pts:
