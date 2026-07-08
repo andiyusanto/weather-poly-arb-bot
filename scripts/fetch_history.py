@@ -37,7 +37,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-import httpx
+import threading
+from urllib.parse import urlparse, urlunparse
+
+import requests
+from requests.adapters import HTTPAdapter
 
 # Make repo modules importable when run as `python scripts/fetch_history.py`.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -46,7 +50,82 @@ from src.polymarket_client import _classify_market, _parse_clob_ids, _parse_res_
 
 GAMMA = "https://gamma-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
+HOSTS = ("gamma-api.polymarket.com", "clob.polymarket.com")
+DOH_URL = "https://1.1.1.1/dns-query"
 DB_PATH = Path(__file__).resolve().parent.parent / "data" / "history.db"
+
+
+# ── Hijack-proof session (ported from Polymarket-Signal-Edge-Finder) ─────────
+# Some ISPs DNS-hijack *.polymarket.com to a block page. Re-resolve via
+# DNS-over-HTTPS at 1.1.1.1 (reachable by IP) and pin the real IP while
+# keeping full TLS verification (SNI + cert hostname) against the real host.
+
+class _PinnedHostAdapter(HTTPAdapter):
+    def __init__(self, hostname: str, ip: str, **kwargs):
+        self._hostname = hostname
+        self._ip = ip
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["server_hostname"] = self._hostname
+        kwargs["assert_hostname"] = self._hostname
+        super().init_poolmanager(*args, **kwargs)
+
+    def send(self, request, **kwargs):
+        parts = urlparse(request.url)
+        if parts.hostname == self._hostname:
+            netloc = self._ip if parts.port is None else f"{self._ip}:{parts.port}"
+            request.url = urlunparse(parts._replace(netloc=netloc))
+            request.headers["Host"] = self._hostname
+        return super().send(request, **kwargs)
+
+
+def _doh_resolve(hostname: str) -> str:
+    r = requests.get(DOH_URL, params={"name": hostname, "type": "A"},
+                     headers={"accept": "application/dns-json"}, timeout=15)
+    r.raise_for_status()
+    answers = [a["data"] for a in r.json().get("Answer", []) if a.get("type") == 1]
+    if not answers:
+        raise RuntimeError(f"DoH returned no A records for {hostname}")
+    return answers[0]
+
+
+def _dns_is_hijacked() -> bool:
+    try:
+        requests.head(f"{GAMMA}/markets", timeout=10).raise_for_status()
+        return False
+    except requests.exceptions.SSLError:
+        return True
+    except requests.exceptions.RequestException:
+        return True  # unresolvable/reset — try DoH pinning either way
+
+
+_PINNED_IPS: dict = {}
+
+
+def make_session() -> requests.Session:
+    sess = requests.Session()
+    sess.headers["User-Agent"] = "weather-poly-arb-bot/history-fetch"
+    for host, ip in _PINNED_IPS.items():
+        sess.mount(f"https://{host}", _PinnedHostAdapter(host, ip))
+    return sess
+
+
+def init_network() -> None:
+    if _dns_is_hijacked():
+        print("[net] polymarket.com unreachable via local DNS; pinning via 1.1.1.1 DoH")
+        for host in HOSTS:
+            _PINNED_IPS[host] = _doh_resolve(host)
+            print(f"[net]   {host} -> {_PINNED_IPS[host]}")
+
+
+_tls = threading.local()
+
+
+def _thread_session() -> requests.Session:
+    if not hasattr(_tls, "sess"):
+        _tls.sess = make_session()
+    return _tls.sess
 
 # Stay far below CLOB rate limits; 429s trigger exponential backoff anyway.
 MAX_WORKERS = 5
@@ -92,11 +171,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _get_json(client: httpx.Client, url: str, params: dict, retries: int = 4):
+def _get_json(client: requests.Session, url: str, params: dict, retries: int = 4):
     """GET with 429/5xx exponential backoff."""
     for attempt in range(retries):
         try:
-            resp = client.get(url, params=params)
+            resp = client.get(url, params=params, timeout=30)
             if resp.status_code == 429 or resp.status_code >= 500:
                 wait = 2 ** attempt
                 print(f"  HTTP {resp.status_code} on {url} — backoff {wait}s")
@@ -104,7 +183,7 @@ def _get_json(client: httpx.Client, url: str, params: dict, retries: int = 4):
                 continue
             resp.raise_for_status()
             return resp.json()
-        except httpx.HTTPError as e:
+        except requests.RequestException:
             if attempt == retries - 1:
                 raise
             time.sleep(2 ** attempt)
@@ -131,11 +210,11 @@ def _winner_from_outcome_prices(raw) -> Optional[str]:
     return None
 
 
-def _winner_from_clob(client: httpx.Client, condition_id: str) -> Optional[str]:
+def _winner_from_clob(client: requests.Session, condition_id: str) -> Optional[str]:
     """Fallback: CLOB /markets/{conditionId} tokens[].winner (proven reliable)."""
     try:
         data = _get_json(client, f"{CLOB}/markets/{condition_id}", {})
-    except httpx.HTTPError:
+    except requests.RequestException:
         return None
     for tok in data.get("tokens", []):
         if tok.get("winner"):
@@ -151,7 +230,8 @@ def fetch_buckets(conn: sqlite3.Connection, days: int) -> None:
     known = {r[0] for r in conn.execute("SELECT condition_id FROM hist_buckets")}
     n_new = n_unresolved = 0
 
-    with httpx.Client(timeout=30) as client:
+    client = make_session()
+    if True:
         for tag_slug in ("weather", "precipitation"):
             offset = 0
             consecutive_old_pages = 0
@@ -183,6 +263,20 @@ def fetch_buckets(conn: sqlite3.Connection, days: int) -> None:
                         if not classification:
                             continue
                         mtype, city, target_date, bucket_label, (lower, upper) = classification
+                        # _classify_market assumes an ACTIVE market and rolls
+                        # past month/days into next year. For historical data,
+                        # re-anchor the year to the market's end date: pick the
+                        # candidate year closest to when it actually resolved.
+                        if end:
+                            candidates = []
+                            for y in (end.year - 1, end.year, end.year + 1):
+                                try:
+                                    candidates.append(target_date.replace(year=y))
+                                except ValueError:  # Feb 29
+                                    continue
+                            target_date = min(
+                                candidates,
+                                key=lambda d: abs((d - end.date()).days))
 
                         winner = _winner_from_outcome_prices(item.get("outcomePrices"))
                         winner_src = "gamma" if winner else None
@@ -240,7 +334,8 @@ def refresh_unresolved(conn: sqlite3.Connection, cap: int = 500) -> None:
         return
     print(f"Retrying winner lookup for {len(rows)} unresolved buckets…")
     n_fixed = 0
-    with httpx.Client(timeout=30) as client:
+    client = make_session()
+    if True:
         for (cid,) in rows:
             winner = _winner_from_clob(client, cid)
             if winner:
@@ -256,10 +351,9 @@ def refresh_unresolved(conn: sqlite3.Connection, cap: int = 500) -> None:
 def _fetch_one_price_series(token_id: str) -> tuple[str, str, list]:
     """Worker: one token's full-life hourly price series."""
     try:
-        with httpx.Client(timeout=30) as client:
-            data = _get_json(client, f"{CLOB}/prices-history",
-                             {"market": token_id, "interval": "max",
-                              "fidelity": PRICE_FIDELITY_MIN})
+        data = _get_json(_thread_session(), f"{CLOB}/prices-history",
+                         {"market": token_id, "interval": "max",
+                          "fidelity": PRICE_FIDELITY_MIN})
         pts = data.get("history", []) or []
         return token_id, ("ok" if pts else "empty"), pts
     except Exception as e:  # noqa: BLE001 — worker must not kill the pool
@@ -310,6 +404,7 @@ def main() -> None:
                     help="cap phase-2 series (bounded test run)")
     args = ap.parse_args()
 
+    init_network()
     conn = sqlite3.connect(DB_PATH)
     conn.executescript(SCHEMA)
     print(f"DB: {DB_PATH}")
