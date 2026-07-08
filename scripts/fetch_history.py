@@ -230,15 +230,27 @@ def fetch_buckets(conn: sqlite3.Connection, days: int) -> None:
     known = {r[0] for r in conn.execute("SELECT condition_id FROM hist_buckets")}
     n_new = n_unresolved = 0
 
+    # Gamma rejects offsets past ~2000, so deep pagination is impossible.
+    # Instead, walk 7-day end_date windows from now back to the cutoff and
+    # offset-paginate within each window (a window is a few hundred events).
+    now = datetime.now(timezone.utc)
+    windows = []
+    w_end = now
+    while w_end > cutoff:
+        w_start = max(cutoff, w_end - timedelta(days=7))
+        windows.append((w_start, w_end))
+        w_end = w_start
+
     client = make_session()
-    if True:
-        for tag_slug in ("weather", "precipitation"):
+    for tag_slug in ("weather", "precipitation"):
+        for w_start, w_end in windows:
             offset = 0
-            consecutive_old_pages = 0
-            while offset < 40_000:  # hard safety cap
+            while offset < 2000:  # Gamma offset ceiling
                 params = {
                     "limit": 100, "offset": offset, "tag_slug": tag_slug,
-                    "closed": "true", "order": "endDate", "ascending": "false",
+                    "closed": "true",
+                    "end_date_min": w_start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "end_date_max": w_end.strftime("%Y-%m-%dT%H:%M:%SZ"),
                 }
                 events = _get_json(client, f"{GAMMA}/events", params)
                 if isinstance(events, dict):
@@ -246,11 +258,8 @@ def fetch_buckets(conn: sqlite3.Connection, days: int) -> None:
                 if not events:
                     break
 
-                page_all_old = True
                 for event in events:
                     event_end = _parse_res_time(event.get("endDate"))
-                    if event_end and event_end >= cutoff:
-                        page_all_old = False
                     for item in event.get("markets", []):
                         cid = item.get("conditionId") or ""
                         if not cid or cid in known:
@@ -304,16 +313,10 @@ def fetch_buckets(conn: sqlite3.Connection, days: int) -> None:
                         known.add(cid)
                         n_new += 1
                 conn.commit()
-                print(f"[{tag_slug}] offset={offset}: +{n_new} buckets total "
-                      f"({n_unresolved} unresolved)")
+                print(f"[{tag_slug}] {w_start.date()}..{w_end.date()} offset={offset}: "
+                      f"+{n_new} buckets total ({n_unresolved} unresolved)")
 
                 if len(events) < 100:
-                    break
-                # Events are requested newest-first, but don't trust a single
-                # page's ordering: stop only after 3 consecutive pages entirely
-                # older than the cutoff.
-                consecutive_old_pages = consecutive_old_pages + 1 if page_all_old else 0
-                if consecutive_old_pages >= 3:
                     break
                 offset += 100
                 time.sleep(0.3)
