@@ -128,7 +128,7 @@ def _thread_session() -> requests.Session:
     return _tls.sess
 
 # Stay far below CLOB rate limits; 429s trigger exponential backoff anyway.
-MAX_WORKERS = 5
+MAX_WORKERS = 3
 PRICE_FIDELITY_MIN = 60
 
 SCHEMA = """
@@ -171,13 +171,17 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _get_json(client: requests.Session, url: str, params: dict, retries: int = 4):
-    """GET with 429/5xx exponential backoff."""
+def _get_json(client: requests.Session, url: str, params: dict, retries: int = 6):
+    """GET with 429/5xx/connection-reset exponential backoff.
+
+    Cloudflare answers sustained high request volume with TCP resets rather
+    than 429s; those need long backoffs (up to ~90s), not quick retries.
+    """
     for attempt in range(retries):
         try:
             resp = client.get(url, params=params, timeout=30)
             if resp.status_code == 429 or resp.status_code >= 500:
-                wait = 2 ** attempt
+                wait = 3 * 2 ** attempt
                 print(f"  HTTP {resp.status_code} on {url} — backoff {wait}s")
                 time.sleep(wait)
                 continue
@@ -186,7 +190,7 @@ def _get_json(client: requests.Session, url: str, params: dict, retries: int = 4
         except requests.RequestException:
             if attempt == retries - 1:
                 raise
-            time.sleep(2 ** attempt)
+            time.sleep(3 * 2 ** attempt)
     raise RuntimeError(f"unreachable: {url}")
 
 
@@ -403,7 +407,7 @@ def fetch_prices(conn: sqlite3.Connection, max_tokens: Optional[int]) -> None:
             if n_done % 200 == 0:
                 conn.commit()
                 print(f"  {n_done}/{len(todo)} series fetched")
-            time.sleep(0.05)  # ~global 5 req/s ceiling across workers
+            time.sleep(0.15)  # gentler after Cloudflare resets at sustained 5 req/s
     conn.commit()
     ok = conn.execute(
         "SELECT COUNT(*) FROM hist_price_status WHERE status='ok'").fetchone()[0]
