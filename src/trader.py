@@ -13,6 +13,7 @@ live           : dry_run=False, shadow=False — real orders placed via CLOB.
 from __future__ import annotations
 
 import asyncio
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -22,7 +23,11 @@ from rich.console import Console
 from rich.table import Table
 
 from config.settings import TRADES_DB, settings
-from src.polymarket_client import fetch_market_resolutions, place_market_order
+from src.polymarket_client import (
+    fetch_market_resolutions,
+    fetch_yes_price_at,
+    place_market_order,
+)
 from src.scanner import ScanResult, display_opportunities, run_scan
 from src.strategy import Opportunity, apply_daily_limit
 from src.utils import TradeStore, fmt_pct, fmt_usdc, now_utc
@@ -104,6 +109,26 @@ def _daily_summary_alert(result: ScanResult, executed: List[Opportunity], mode: 
 
 
 # ── Trade execution ───────────────────────────────────────────────────────────
+
+# One momentum lookup per (token, hour): the parallel-shadow control and the
+# live trade record the same bucket seconds apart — don't fetch twice.
+_momentum_cache: dict = {}
+
+
+def _yes_price_24h_ago(yes_token_id: str) -> Optional[float]:
+    """Best-effort YES price ~24h ago for momentum logging (None on failure)."""
+    hour_bucket = int(time.time() // 3600)
+    key = (yes_token_id, hour_bucket)
+    if key not in _momentum_cache:
+        # Drop entries from previous hours; keep this hour's (shadow + live
+        # legs of several opportunities interleave within one cycle).
+        for stale in [k for k in _momentum_cache if k[1] != hour_bucket]:
+            del _momentum_cache[stale]
+        _momentum_cache[key] = fetch_yes_price_at(
+            yes_token_id, int(time.time()) - 24 * 3600
+        )
+    return _momentum_cache[key]
+
 
 def execute_opportunity(
     opp: Opportunity,
@@ -213,6 +238,7 @@ def execute_opportunity(
 
     forecast_mean = getattr(opp.forecast, "mean_f", None)
     trade_record = dict(
+        yes_price_24h_ago=_yes_price_24h_ago(opp.bucket.token_id),
         market_id=opp.market.market_id,
         condition_id=opp.bucket.condition_id,
         token_id=trade_token,

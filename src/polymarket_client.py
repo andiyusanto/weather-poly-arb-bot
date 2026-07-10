@@ -643,6 +643,35 @@ def _get_clob_client():
         return None
 
 
+def fetch_yes_price_at(token_id: str, ts_epoch: int) -> Optional[float]:
+    """
+    Historical YES price nearest (at or before) a unix timestamp, via the
+    public CLOB /prices-history endpoint. Used to log 24h price momentum on
+    trade records (momentum study 2026-07-10: YES-fell buckets win NO 73-76%
+    vs 67-68% for YES-rose).
+
+    Returns None on any failure or if no point lies within 3h of the target —
+    momentum logging is best-effort and must never block trading.
+    """
+    if not token_id:
+        return None
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(
+                f"{settings.clob_host}/prices-history",
+                params={"market": token_id, "startTs": ts_epoch - 3 * 3600,
+                        "endTs": ts_epoch, "fidelity": 60},
+            )
+            resp.raise_for_status()
+            pts = resp.json().get("history", []) or []
+    except (httpx.HTTPError, ValueError) as e:
+        logger.warning(f"momentum price lookup failed for {token_id[:16]}…: {e}")
+        return None
+    if not pts:
+        return None
+    return float(pts[-1]["p"])
+
+
 @http_retry
 def fetch_live_prices(token_ids: List[str]) -> Dict[str, Dict[str, float]]:
     """

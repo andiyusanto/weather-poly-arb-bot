@@ -141,6 +141,56 @@ class ScanResult:
 
 # ── Main scan ─────────────────────────────────────────────────────────────────
 
+def event_overround(market: WeatherMarket, min_buckets: int = 3) -> Optional[float]:
+    """Sum of YES asks across an event's priced buckets.
+
+    A mutually-exclusive bucket set should sum to ~1. A sum well above 1 means
+    every bucket is overpriced — buying NO across all of them locks in margin
+    (historical study 2026-07-10: sum>1.15 at 24h → NO ROI +17.2%, n=92).
+    Missing/unpriced buckets UNDERcount the sum, so a high reading is
+    conservative. Returns None when fewer than ``min_buckets`` are priced.
+    """
+    asks = [b.best_ask for b in market.buckets if 0.0 < b.best_ask < 1.0]
+    if len(asks) < min_buckets:
+        return None
+    return sum(asks)
+
+
+# Events already alerted this process (avoid re-alerting every 30-min cycle).
+_overround_alerted: set = set()
+
+
+def _check_overround_alerts(markets: List[WeatherMarket]) -> None:
+    """Telegram-alert dislocated events (structural NO-arb candidates)."""
+    threshold = settings.overround_alert_min_sum
+    if threshold <= 0:
+        return
+    for m in markets:
+        total = event_overround(m)
+        if total is None or total < threshold:
+            continue
+        key = (m.market_id, m.target_date.isoformat() if m.target_date else "")
+        if key in _overround_alerted:
+            continue
+        _overround_alerted.add(key)
+        n_priced = len([b for b in m.buckets if 0.0 < b.best_ask < 1.0])
+        logger.warning(
+            f"OVERROUND: {m.city} {m.target_date} Σ(YES asks)={total:.3f} over "
+            f"{n_priced} buckets (≥{threshold:.2f}) — buying NO on all priced "
+            f"buckets locks in ~{(total - 1) * 100:.0f}¢/$1 gross"
+        )
+        try:
+            from src.trader import send_telegram
+            send_telegram(
+                f"🎯 OVERROUND {m.city} {m.target_date}\n"
+                f"Σ YES asks = {total:.3f} across {n_priced} buckets\n"
+                f"Buy NO on ALL priced buckets ≈ +{(total - 1) * 100:.0f}¢/$1 gross "
+                f"(check book depth first — manual trade)"
+            )
+        except Exception as e:  # noqa: BLE001 — alerting must never kill the scan
+            logger.error(f"Overround Telegram alert failed: {e}")
+
+
 def run_scan(
     min_ev: Optional[float] = None,
     min_confidence: Optional[float] = None,
@@ -201,6 +251,10 @@ def run_scan(
                 logger.debug(f"Skipping {m.city}/{m.market_type.value} ({h:.0f}h > {max_hours}h)")
                 continue
         active_markets.append(m)
+
+    # Overround alert — checked on the FULL near-resolution universe, before
+    # the allowlist narrows it: a dislocated event in any city is actionable.
+    _check_overround_alerts(active_markets)
 
     # City allowlist filter — applied BEFORE forecast fetch so disallowed cities
     # don't consume Open-Meteo quota. Empty allowlist = no filter (trade all).

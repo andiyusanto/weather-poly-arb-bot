@@ -145,6 +145,14 @@ class Settings(BaseSettings):
     # own dedup namespace and never consume live quota.
     parallel_shadow: bool = True
 
+    # ── Overround alert ──────────────────────────────────────────────────────
+    # Alert (Telegram + WARNING log) when an event's YES asks sum to at least
+    # this value: every bucket is overpriced, so buying NO across all of them
+    # locks in ~ (sum - 1) gross margin. Historical study 2026-07-10: sum>1.15
+    # at 24h → NO ROI +17.2% (n=92, ~1% of events). Alert-only (manual trade);
+    # 0 disables. Threshold 1.10 leaves ~8¢ after fee+slip on both leg sets.
+    overround_alert_min_sum: float = 1.10
+
     # ── Consecutive-loss Telegram alert ─────────────────────────────────────
     # When the most recent ``consecutive_loss_alert`` LIVE trades all lost,
     # send a Telegram message on the next resolution cycle that includes at
