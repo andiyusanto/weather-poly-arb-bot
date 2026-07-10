@@ -200,6 +200,8 @@ class TradeStore:
             ("condition_id",  "TEXT"),     # Polymarket conditionId for resolution lookup
             ("contrarian",    "INTEGER DEFAULT 0"),  # 1 if side was flipped from YES→NO by Option F
             ("yes_price_24h_ago", "REAL"),  # YES price ~24h before entry (momentum logging)
+            ("model_means", "TEXT"),        # JSON {model: mean_f} at trade time (per-model bias/BMA)
+            ("ensemble_spread", "REAL"),    # combined ensemble std_f at trade time (full-EMOS study)
         ]:
             if col not in existing:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {defn}")
@@ -216,6 +218,8 @@ class TradeStore:
         trade.setdefault("condition_id", "")
         trade.setdefault("contrarian", 0)
         trade.setdefault("yes_price_24h_ago", None)
+        trade.setdefault("model_means", None)
+        trade.setdefault("ensemble_spread", None)
         with sqlite3.connect(self._db) as conn:
             # NOTE: contrarian was in the migration + setdefault but missing
             # from this INSERT until 2026-07-10, so it silently persisted as
@@ -227,11 +231,11 @@ class TradeStore:
                     (market_id, token_id, city, bucket_label, model_prob, market_price, ev,
                      confidence, size_usdc, side, dry_run, shadow, outcome, pnl, timestamp,
                      resolved_at, market_type, target_date, forecast_mean, condition_id,
-                     contrarian, yes_price_24h_ago)
+                     contrarian, yes_price_24h_ago, model_means, ensemble_spread)
                 VALUES (:market_id,:token_id,:city,:bucket_label,:model_prob,:market_price,:ev,
                         :confidence,:size_usdc,:side,:dry_run,:shadow,:outcome,:pnl,:timestamp,
                         :resolved_at,:market_type,:target_date,:forecast_mean,:condition_id,
-                        :contrarian,:yes_price_24h_ago)
+                        :contrarian,:yes_price_24h_ago,:model_means,:ensemble_spread)
                 """,
                 trade,
             )

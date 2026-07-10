@@ -10,6 +10,7 @@ and stores ``observed - forecast`` per (city, model, variable, target_date).
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import date as date_type, datetime
 from typing import Optional
@@ -136,22 +137,42 @@ def record_bias_for_resolved_trade(trade: dict) -> bool:
     if market_type == "temperature":
         observed = celsius_to_fahrenheit(observed)
 
-    # Store one bias entry per ensemble model so the rolling correction has
-    # per-model history. We use a single combined entry tagged "ensemble" —
-    # this is a coarse approximation but better than no signal.
-    for model in settings.ensemble_model_list:
-        _bias_store.record(
-            city=city,
-            model=model,
-            variable=variable,
-            target_date=target,
-            forecast_mean=float(forecast_mean),
-            observed=float(observed),
-        )
+    # Combined-mean row: the ground truth for EMOS sigma and dispersion floor.
+    _bias_store.record(
+        city=city, model="ensemble", variable=variable, target_date=target,
+        forecast_mean=float(forecast_mean), observed=float(observed),
+    )
+
+    # Per-model rows: use each model's OWN mean when the trade carried it
+    # (model_means JSON, recorded since 2026-07-10). Before that fix the
+    # combined mean was duplicated under every model name, which made
+    # per-model bias correction a no-op and BMA weights unfittable.
+    per_model = {}
+    raw_means = trade.get("model_means")
+    if raw_means:
+        try:
+            per_model = {m: float(v) for m, v in json.loads(raw_means).items()}
+        except (ValueError, TypeError) as e:
+            logger.warning(f"unparseable model_means for {city}/{target}: {e}")
+    if per_model:
+        for model, mean in per_model.items():
+            _bias_store.record(
+                city=city, model=model, variable=variable, target_date=target,
+                forecast_mean=mean, observed=float(observed),
+            )
+    else:
+        # Legacy trades without per-model means: keep the old duplication so
+        # per-model rolling bias still receives (combined-mean) signal.
+        for model in settings.ensemble_model_list:
+            _bias_store.record(
+                city=city, model=model, variable=variable, target_date=target,
+                forecast_mean=float(forecast_mean), observed=float(observed),
+            )
 
     logger.info(
         f"bias recorded {city}/{variable} {target}: "
         f"forecast={forecast_mean:.2f} observed={observed:.2f} "
         f"err={observed - forecast_mean:+.2f}"
+        + (f" (+{len(per_model)} per-model rows)" if per_model else "")
     )
     return True

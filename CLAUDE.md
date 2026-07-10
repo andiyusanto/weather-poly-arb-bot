@@ -35,7 +35,12 @@ This is a **production Python bot** exploiting systematic edge in Polymarket's d
 
 ### Domain Rules (Non-negotiable)
 1. **Precipitation & Snowfall** use **empirical counting** – never KDE (zero-inflation would break).
-2. **Temperature** uses **Gaussian KDE** with `bandwidth = 0.3 * std` (min 0.5°F).
+2. **Temperature** has two engines behind `FORECAST_ENGINE` (default `kde`):
+   - `kde`: Gaussian KDE over ensemble members, `bandwidth = 0.3 * std` (min 0.5°F).
+   - `emos`: Gaussian at the bias-corrected ensemble mean with per-city climatological
+     error σ from the bias store (EMOS-lite; out-of-sample CRPS 0.955 vs 1.019,
+     2026-07-10). Falls back to KDE when bias history is too thin.
+   Never flip engines mid-experiment (contaminates live/shadow comparisons).
 3. **Multi-model weights**: ECMWF=1.1, ICON=1.0, GFS=0.9, GEM=0.8.
 4. **Bias correction**: 30-day rolling mean per city/model/variable.
 5. **Unit conversions**: Always convert inches to cm (1 in = 2.54 cm) for precip/snow before comparing to market buckets.

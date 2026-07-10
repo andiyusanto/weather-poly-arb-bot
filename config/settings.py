@@ -145,6 +145,15 @@ class Settings(BaseSettings):
     # own dedup namespace and never consume live quota.
     parallel_shadow: bool = True
 
+    # ── Forecast engine (temperature) ────────────────────────────────────────
+    # "kde": Gaussian KDE over weighted ensemble members (legacy default).
+    # "emos": Gaussian at the bias-corrected ensemble mean with a PER-CITY
+    #         climatological error std from the bias store (EMOS-lite).
+    #         Offline validation 2026-07-10 (train/test on 733 city-days):
+    #         CRPS 0.955 vs 1.019, bucket log-score -1.391 vs -1.517.
+    # Do not flip to "emos" mid-experiment — wait for the live/shadow verdict.
+    forecast_engine: str = "kde"
+
     # ── Overround alert ──────────────────────────────────────────────────────
     # Alert (Telegram + WARNING log) when an event's YES asks sum to at least
     # this value: every bucket is overpriced, so buying NO across all of them

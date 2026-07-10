@@ -13,6 +13,7 @@ live           : dry_run=False, shadow=False — real orders placed via CLOB.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -237,8 +238,16 @@ def execute_opportunity(
             recorded_size = float(rs)
 
     forecast_mean = getattr(opp.forecast, "mean_f", None)
+    # Per-model means + combined spread let the bias recorder attribute error
+    # to individual models (BMA weights) and the full-EMOS study use spread.
+    model_results = getattr(opp.forecast, "model_results", None) or []
+    model_means_json = json.dumps(
+        {r.model_name: round(r.mean_f, 2) for r in model_results}
+    ) if model_results else None
     trade_record = dict(
         yes_price_24h_ago=_yes_price_24h_ago(opp.bucket.token_id),
+        model_means=model_means_json,
+        ensemble_spread=getattr(opp.forecast, "std_f", None),
         market_id=opp.market.market_id,
         condition_id=opp.bucket.condition_id,
         token_id=trade_token,

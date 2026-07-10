@@ -9,6 +9,7 @@ distributions where KDE performs poorly.
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import threading
 import time
@@ -148,7 +149,9 @@ class ForecastResult:
 
 @dataclass
 class EnsembleForecast:
-    """Temperature forecast — KDE over °F ensemble members."""
+    """Temperature forecast — KDE over °F ensemble members, or (when
+    ``emos_sigma_f`` is set by the EMOS engine) a Gaussian at the
+    bias-corrected combined mean with a per-city climatological error std."""
     city: str
     target_date: date
     model_results: List[ForecastResult] = field(default_factory=list)
@@ -157,8 +160,21 @@ class EnsembleForecast:
     mean_f: float = 0.0
     std_f: float = 0.0
     confidence: float = 0.0
+    # EMOS engine: predictive sigma from BiasStore.city_error_sigma. None → KDE.
+    emos_sigma_f: Optional[float] = None
 
     def bucket_probability(self, lower_f: float, upper_f: float) -> float:
+        if self.emos_sigma_f:
+            # EMOS-lite: closed-form Gaussian mass on the bucket. The mean
+            # inherits bias correction and the intraday max-so-far tightening
+            # (both applied to the members before mean_f is computed); the
+            # second moment is the city's realized forecast-error sigma,
+            # which out-of-sample beat ensemble spread + global floor
+            # (CRPS 0.955 vs 1.019, 2026-07-10).
+            sd = self.emos_sigma_f * math.sqrt(2.0)
+            prob = 0.5 * (math.erf((upper_f - self.mean_f) / sd)
+                          - math.erf((lower_f - self.mean_f) / sd))
+            return max(0.0, min(1.0, prob))
         if self.combined_kde is None or not self.combined_members_f:
             return 0.0
         pts = np.linspace(lower_f, upper_f, 200)
@@ -335,26 +351,65 @@ class BiasStore:
             ).fetchall()
         return float(np.mean([r[0] for r in rows])) if rows else 0.0
 
+    def _combined_errors(self, variable: str, city: Optional[str] = None) -> List[float]:
+        """
+        Errors of the COMBINED ensemble mean, one value per (city, date).
+
+        Prefers rows tagged model='ensemble' (written since the 2026-07-10
+        recorder fix). Legacy rows duplicated the combined mean under every
+        model name, so averaging per (city, date) reproduces the combined
+        error exactly for old data — and blends per-model errors (a fine
+        proxy) for post-fix rows on days without an ensemble tag.
+        """
+        with sqlite3.connect(self._db) as c:
+            where_city = " AND city=?" if city else ""
+            args: tuple = (variable, city) if city else (variable,)
+            rows = c.execute(
+                f"SELECT error FROM bias WHERE variable=? AND model='ensemble'{where_city}",
+                args,
+            ).fetchall()
+            if not rows:
+                rows = c.execute(
+                    f"""SELECT AVG(error) FROM bias
+                        WHERE variable=? AND model!='ensemble'{where_city}
+                        GROUP BY city, target_date""",
+                    args,
+                ).fetchall()
+        return [r[0] for r in rows if r[0] is not None]
+
     def error_std(self, variable: str = "temperature",
                   min_samples: int = MIN_DISPERSION_SAMPLES) -> Optional[float]:
         """
-        Std of realized forecast errors (observed − forecast_mean) for a variable.
-
-        This is the empirical predictive uncertainty of the ensemble *mean* — the
-        floor the forecast spread should not undercut. Deduped by (city, date) so
-        the per-model triplication in bias_recorder doesn't skew the count;
-        duplication wouldn't change the std, but it would inflate the sample count
-        past ``min_samples`` prematurely. Returns None if too few samples.
+        Global std of realized combined-mean forecast errors — the floor the
+        forecast spread should not undercut. Returns None if too few samples.
         """
-        with sqlite3.connect(self._db) as c:
-            rows = c.execute(
-                "SELECT DISTINCT city, target_date, error FROM bias WHERE variable=?",
-                (variable,),
-            ).fetchall()
-        errs = [r[2] for r in rows if r[2] is not None]
+        errs = self._combined_errors(variable)
         if len(errs) < min_samples:
             return None
         return float(np.std(errs))
+
+    def city_error_sigma(self, city: str, variable: str = "temperature",
+                         shrink_k: int = 10,
+                         min_global: int = MIN_DISPERSION_SAMPLES) -> Optional[float]:
+        """
+        Per-city predictive sigma for the EMOS engine, shrunk toward the
+        global error std by w = n/(n+k). Per-city stds ranged 1.0–3.8°F on
+        2026-07-10, so a single global sigma is wrong in both directions:
+        underconfident in tight cities, overconfident in volatile ones.
+
+        Returns None when even the global history is too thin — callers must
+        fall back to the KDE/dispersion-floor path.
+        """
+        all_errs = self._combined_errors(variable)
+        if len(all_errs) < min_global:
+            return None
+        g_var = float(np.var(all_errs))
+        city_errs = self._combined_errors(variable, city=city)
+        n = len(city_errs)
+        if n < 2:
+            return float(np.sqrt(g_var))
+        w = n / (n + shrink_k)
+        return float(np.sqrt(w * float(np.var(city_errs)) + (1 - w) * g_var))
 
 
 _bias_store = BiasStore()
@@ -616,9 +671,22 @@ def get_ensemble_forecast(
     result.std_f = float(np.std(all_weighted))
     result.confidence = _temp_confidence(result.std_f, len(result.model_results))
 
+    # EMOS engine: swap the second moment for the city's realized error sigma.
+    # Falls back to KDE silently when the bias history is too thin to fit.
+    engine = "kde"
+    if settings.forecast_engine == "emos":
+        sigma = _bias_store.city_error_sigma(city)
+        if sigma is not None:
+            result.emos_sigma_f = max(sigma, 0.8)  # never sharper than 0.8°F
+            engine = "emos"
+        else:
+            logger.debug(f"  [{city}] EMOS requested but bias history too thin — KDE fallback")
+
     logger.info(
-        f"Temp forecast {city} {target_date}: mean={result.mean_f:.1f}°F "
-        f"std={result.std_f:.1f}°F conf={result.confidence:.2f} "
+        f"Temp forecast {city} {target_date} [{engine}]: mean={result.mean_f:.1f}°F "
+        f"std={result.std_f:.1f}°F"
+        + (f" emos_sigma={result.emos_sigma_f:.2f}°F" if result.emos_sigma_f else "")
+        + f" conf={result.confidence:.2f} "
         f"models={[m.model_name for m in result.model_results]}"
     )
     return result
