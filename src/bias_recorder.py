@@ -138,10 +138,18 @@ def record_bias_for_resolved_trade(trade: dict) -> bool:
         observed = celsius_to_fahrenheit(observed)
 
     # Combined-mean row: the ground truth for EMOS sigma and dispersion floor.
-    _bias_store.record(
-        city=city, model="ensemble", variable=variable, target_date=target,
-        forecast_mean=float(forecast_mean), observed=float(observed),
-    )
+    # SKIPPED for same-day trades: their combined mean was tightened with the
+    # intraday max-so-far, so the error is structurally tiny — feeding those
+    # rows into city_error_sigma would shrink the EMOS sigma below the true
+    # day-ahead error as same-day volume accumulates (self-sharpening loop).
+    # Per-model rows below are safe: model means are computed BEFORE the clamp.
+    trade_ts = str(trade.get("timestamp") or "")
+    same_day_trade = trade_ts[:10] == target_str
+    if not same_day_trade:
+        _bias_store.record(
+            city=city, model="ensemble", variable=variable, target_date=target,
+            forecast_mean=float(forecast_mean), observed=float(observed),
+        )
 
     # Per-model rows: use each model's OWN mean when the trade carried it
     # (model_means JSON, recorded since 2026-07-10). Before that fix the
@@ -152,7 +160,9 @@ def record_bias_for_resolved_trade(trade: dict) -> bool:
     if raw_means:
         try:
             per_model = {m: float(v) for m, v in json.loads(raw_means).items()}
-        except (ValueError, TypeError) as e:
+        except (ValueError, TypeError, AttributeError) as e:
+            # AttributeError: valid JSON that isn't an object (list/str/number)
+            # has no .items() — must not abort the remaining rows mid-write.
             logger.warning(f"unparseable model_means for {city}/{target}: {e}")
     if per_model:
         for model, mean in per_model.items():

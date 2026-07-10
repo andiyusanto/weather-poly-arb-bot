@@ -142,18 +142,21 @@ class ScanResult:
 # ── Main scan ─────────────────────────────────────────────────────────────────
 
 def event_overround(market: WeatherMarket, min_buckets: int = 3) -> Optional[float]:
-    """Sum of YES asks across an event's priced buckets.
+    """Sum of YES BIDS across an event's priced buckets.
 
-    A mutually-exclusive bucket set should sum to ~1. A sum well above 1 means
-    every bucket is overpriced — buying NO across all of them locks in margin
-    (historical study 2026-07-10: sum>1.15 at 24h → NO ROI +17.2%, n=92).
-    Missing/unpriced buckets UNDERcount the sum, so a high reading is
-    conservative. Returns None when fewer than ``min_buckets`` are priced.
+    Buying NO on bucket i executes at ~(1 - YES_bid_i), so an all-NO basket
+    on n buckets costs n - Σ(YES bids) and pays n - 1: the arb condition is
+    Σ(YES bids) > 1, NOT Σ(asks) — with normal spreads Σ(asks) > 1.1 is the
+    ordinary no-arb state, and summing asks would alert on guaranteed-loss
+    baskets. Bids also make dust buckets (bid≈0) and settled-but-open events
+    self-excluding. Missing/unpriced buckets UNDERcount the sum, so a high
+    reading is conservative. Returns None when fewer than ``min_buckets``
+    buckets carry a bid.
     """
-    asks = [b.best_ask for b in market.buckets if 0.0 < b.best_ask < 1.0]
-    if len(asks) < min_buckets:
+    bids = [b.best_bid for b in market.buckets if 0.0 < b.best_bid < 1.0]
+    if len(bids) < min_buckets:
         return None
-    return sum(asks)
+    return sum(bids)
 
 
 # Events already alerted this process (avoid re-alerting every 30-min cycle).
@@ -166,6 +169,11 @@ def _check_overround_alerts(markets: List[WeatherMarket]) -> None:
     if threshold <= 0:
         return
     for m in markets:
+        # Only future-resolution events: a day already elapsed but not yet
+        # closed on Gamma quotes the winner near 1.0 — any "overround" there
+        # is settlement dust, not a tradable dislocation.
+        if m.resolution_datetime and hours_until(m.resolution_datetime) <= 0:
+            continue
         total = event_overround(m)
         if total is None or total < threshold:
             continue
@@ -173,9 +181,9 @@ def _check_overround_alerts(markets: List[WeatherMarket]) -> None:
         if key in _overround_alerted:
             continue
         _overround_alerted.add(key)
-        n_priced = len([b for b in m.buckets if 0.0 < b.best_ask < 1.0])
+        n_priced = len([b for b in m.buckets if 0.0 < b.best_bid < 1.0])
         logger.warning(
-            f"OVERROUND: {m.city} {m.target_date} Σ(YES asks)={total:.3f} over "
+            f"OVERROUND: {m.city} {m.target_date} Σ(YES bids)={total:.3f} over "
             f"{n_priced} buckets (≥{threshold:.2f}) — buying NO on all priced "
             f"buckets locks in ~{(total - 1) * 100:.0f}¢/$1 gross"
         )
@@ -183,9 +191,9 @@ def _check_overround_alerts(markets: List[WeatherMarket]) -> None:
             from src.trader import send_telegram
             send_telegram(
                 f"🎯 OVERROUND {m.city} {m.target_date}\n"
-                f"Σ YES asks = {total:.3f} across {n_priced} buckets\n"
+                f"Σ YES bids = {total:.3f} across {n_priced} buckets\n"
                 f"Buy NO on ALL priced buckets ≈ +{(total - 1) * 100:.0f}¢/$1 gross "
-                f"(check book depth first — manual trade)"
+                f"(verify live books first — manual trade)"
             )
         except Exception as e:  # noqa: BLE001 — alerting must never kill the scan
             logger.error(f"Overround Telegram alert failed: {e}")

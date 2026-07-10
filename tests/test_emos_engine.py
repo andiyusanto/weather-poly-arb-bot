@@ -49,6 +49,23 @@ def test_no_emos_sigma_falls_back_to_kde_path() -> None:
     assert f.bucket_probability(89.0, 91.0) == 0.0
 
 
+def test_emos_censors_at_intraday_floor() -> None:
+    # Same-day market, high already observed at 92°F: buckets entirely below
+    # 92 are impossible; the bucket containing 92 absorbs the censored mass.
+    f = EnsembleForecast(city="X", target_date=date(2026, 7, 10),
+                         mean_f=92.5, emos_sigma_f=2.5, intraday_floor_f=92.0)
+    assert f.bucket_probability(88.0, 90.0) == 0.0          # fully below floor
+    absorbing = f.bucket_probability(91.0, 93.0)            # contains the floor
+    above = f.bucket_probability(93.0, 95.0)
+    # Absorbing bucket gets everything below 93: Φ(93) (uncensored would be
+    # Φ(93)-Φ(91) ≈ 0.31; censored ≈ 0.58).
+    assert abs(absorbing - _gauss_mass(92.5, 2.5, -1e9, 93.0)) < 1e-9
+    assert abs(above - _gauss_mass(92.5, 2.5, 93.0, 95.0)) < 1e-9  # unaffected
+    # Whole-line coverage still sums to ~1 over (floor-containing, above) buckets
+    total = absorbing + above + f.bucket_probability(95.0, 200.0)
+    assert abs(total - 1.0) < 1e-6
+
+
 # ── BiasStore.city_error_sigma ────────────────────────────────────────────────
 
 def _seed(store: BiasStore, city: str, errors: list[float], start_day: int = 1) -> None:
@@ -122,11 +139,44 @@ def test_mixed_legacy_and_ensemble_rows_merge(tmp_path: Path) -> None:
 
 # ── bias recorder: per-model rows from model_means JSON ───────────────────────
 
+def test_recorder_skips_ensemble_row_for_same_day_trades(tmp_path: Path) -> None:
+    # A trade placed ON the target date carries an intraday-clamped combined
+    # mean; its near-zero error must not sharpen the EMOS sigma.
+    import sqlite3
+
+    import src.bias_recorder as br
+    store = BiasStore(tmp_path / "bias.db")
+    trade = dict(city="Testville", target_date="2026-07-09", market_type="temperature",
+                 forecast_mean=90.0, timestamp="2026-07-09T05:01:00+00:00",
+                 model_means=json.dumps({"icon_seamless": 91.0}))
+    with patch.object(br, "_bias_store", store), \
+         patch.object(br._geo, "get", return_value={"lat": 1.0, "lon": 2.0}), \
+         patch.object(br, "_fetch_observed", return_value=32.0):
+        assert br.record_bias_for_resolved_trade(trade) is True
+    with sqlite3.connect(store._db) as conn:
+        models = {r[0] for r in conn.execute("SELECT model FROM bias")}
+    assert models == {"icon_seamless"}  # per-model row yes, ensemble row no
+
+
+def test_recorder_tolerates_non_dict_model_means(tmp_path: Path) -> None:
+    # Valid JSON that isn't an object must fall back to the legacy branch,
+    # not abort mid-write with AttributeError.
+    import src.bias_recorder as br
+    store = BiasStore(tmp_path / "bias.db")
+    trade = dict(city="Testville", target_date="2026-07-08", market_type="temperature",
+                 forecast_mean=90.0, timestamp="2026-07-07T05:00:00+00:00",
+                 model_means=json.dumps([91.0, 89.0]))
+    with patch.object(br, "_bias_store", store), \
+         patch.object(br._geo, "get", return_value={"lat": 1.0, "lon": 2.0}), \
+         patch.object(br, "_fetch_observed", return_value=32.0):
+        assert br.record_bias_for_resolved_trade(trade) is True
+
+
 def test_recorder_writes_per_model_and_ensemble_rows(tmp_path: Path) -> None:
     import src.bias_recorder as br
     store = BiasStore(tmp_path / "bias.db")
     trade = dict(city="Testville", target_date="2026-07-09", market_type="temperature",
-                 forecast_mean=90.0,
+                 forecast_mean=90.0, timestamp="2026-07-08T12:00:00+00:00",
                  model_means=json.dumps({"icon_seamless": 91.0, "gfs_seamless": 89.0}))
     with patch.object(br, "_bias_store", store), \
          patch.object(br._geo, "get", return_value={"lat": 1.0, "lon": 2.0}), \

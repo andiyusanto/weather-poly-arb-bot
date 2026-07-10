@@ -162,19 +162,30 @@ class EnsembleForecast:
     confidence: float = 0.0
     # EMOS engine: predictive sigma from BiasStore.city_error_sigma. None → KDE.
     emos_sigma_f: Optional[float] = None
+    # Same-day markets: the max already observed today. The realized daily
+    # high cannot land below this, so the EMOS Gaussian must be censored at
+    # it (the KDE path gets the same effect from max()-clamped members).
+    intraday_floor_f: Optional[float] = None
 
     def bucket_probability(self, lower_f: float, upper_f: float) -> float:
         if self.emos_sigma_f:
-            # EMOS-lite: closed-form Gaussian mass on the bucket. The mean
-            # inherits bias correction and the intraday max-so-far tightening
-            # (both applied to the members before mean_f is computed); the
-            # second moment is the city's realized forecast-error sigma,
-            # which out-of-sample beat ensemble spread + global floor
+            # EMOS-lite: closed-form Gaussian mass on the bucket, censored at
+            # the intraday floor. Without censoring, a same-day market with
+            # the high already at 92°F would get ~40% mass on physically
+            # impossible sub-92 buckets and manufacture fake NO edge.
+            # Sigma is the city's realized forecast-error std, which
+            # out-of-sample beat ensemble spread + global floor
             # (CRPS 0.955 vs 1.019, 2026-07-10).
+            floor = self.intraday_floor_f
+            if floor is not None and upper_f <= floor:
+                return 0.0  # bucket entirely below what already happened
             sd = self.emos_sigma_f * math.sqrt(2.0)
-            prob = 0.5 * (math.erf((upper_f - self.mean_f) / sd)
-                          - math.erf((lower_f - self.mean_f) / sd))
-            return max(0.0, min(1.0, prob))
+            hi_cdf = 0.5 * (1.0 + math.erf((upper_f - self.mean_f) / sd))
+            if floor is not None and lower_f <= floor:
+                lo_cdf = 0.0  # censored mass collapses into this bucket
+            else:
+                lo_cdf = 0.5 * (1.0 + math.erf((lower_f - self.mean_f) / sd))
+            return max(0.0, min(1.0, hi_cdf - lo_cdf))
         if self.combined_kde is None or not self.combined_members_f:
             return 0.0
         pts = np.linspace(lower_f, upper_f, 200)
@@ -668,6 +679,9 @@ def get_ensemble_forecast(
             # Discard members that are below what already happened.
             tightened = [max(intraday, v) for v in all_weighted]
             all_weighted = tightened
+            # The EMOS Gaussian needs the same lower bound the members just
+            # received — it censors its CDF at this floor.
+            result.intraday_floor_f = intraday
 
     result.combined_members_f = all_weighted
     result.combined_kde = _fit_kde(all_weighted)

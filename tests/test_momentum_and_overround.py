@@ -23,11 +23,12 @@ class _FakeForecast:
     mean_f = 90.0
 
 
-def _market(asks: list[float]) -> WeatherMarket:
+def _market(bids: list[float]) -> WeatherMarket:
     buckets = [
         WeatherBucket(token_id=f"y{i}", outcome_label=f"{30 + i}°C", lower=i, upper=i + 1,
-                      no_token_id=f"n{i}", best_ask=a, best_ask_no=0.5)
-        for i, a in enumerate(asks)
+                      no_token_id=f"n{i}", best_ask=min(0.99, b + 0.03), best_bid=b,
+                      best_ask_no=0.5)
+        for i, b in enumerate(bids)
     ]
     return WeatherMarket(
         market_id="m1", question="q", city="Testville",
@@ -47,18 +48,30 @@ def _opportunity(m: WeatherMarket) -> Opportunity:
 
 
 # ── event_overround ───────────────────────────────────────────────────────────
+# The arb condition is on YES BIDS (buying NO executes at ~1 - YES_bid):
+# summing asks would flag ordinary wide-spread books as guaranteed profit.
 
-def test_overround_sums_priced_buckets() -> None:
+def test_overround_sums_priced_bids() -> None:
     assert abs(event_overround(_market([0.3, 0.4, 0.5])) - 1.2) < 1e-9
 
 
 def test_overround_ignores_unpriced_buckets() -> None:
-    # 0.0 and 1.0 asks are unpriced/degenerate — excluded from the sum.
+    # 0.0 and 1.0 bids are unpriced/degenerate — excluded from the sum.
     assert abs(event_overround(_market([0.3, 0.4, 0.5, 0.0, 1.0])) - 1.2) < 1e-9
 
 
 def test_overround_needs_min_buckets() -> None:
     assert event_overround(_market([0.6, 0.6])) is None
+
+
+def test_overround_wide_spread_book_is_not_an_arb() -> None:
+    # Dust bids with fat asks (ask=bid+0.03 in the fixture, but bids near 0):
+    # sum of ASKS would be ~0.4 here and sum of bids ~0.25 — neither trips the
+    # 1.10 threshold. The regression this guards: an ask-based sum on a book
+    # like bid 0.05/ask 0.30 across 8 buckets (asks 2.4, bids 0.4) must NOT
+    # report an arb. With the bid-based helper the sum is 0.4 → no alert.
+    m = _market([0.05] * 8)
+    assert event_overround(m) < 1.0
 
 
 # ── momentum logging on trade records ─────────────────────────────────────────

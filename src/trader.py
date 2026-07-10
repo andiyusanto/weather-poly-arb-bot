@@ -115,20 +115,28 @@ def _daily_summary_alert(result: ScanResult, executed: List[Opportunity], mode: 
 # live trade record the same bucket seconds apart — don't fetch twice.
 _momentum_cache: dict = {}
 
+# Buckets whose live order recently FAILED (error/rejected — not slip-aborts):
+# no trade row exists for them, so dedup can't block re-entry. Process-local
+# by design: a restart retrying once is acceptable; hammering every 30-min
+# cycle on a persistent failure (insufficient balance) is not.
+_order_failure_cooldown: dict = {}
+_FAILURE_COOLDOWN_S = 3 * 3600.0
+
 
 def _yes_price_24h_ago(yes_token_id: str) -> Optional[float]:
     """Best-effort YES price ~24h ago for momentum logging (None on failure)."""
     hour_bucket = int(time.time() // 3600)
     key = (yes_token_id, hour_bucket)
-    if key not in _momentum_cache:
-        # Drop entries from previous hours; keep this hour's (shadow + live
-        # legs of several opportunities interleave within one cycle).
-        for stale in [k for k in _momentum_cache if k[1] != hour_bucket]:
-            del _momentum_cache[stale]
-        _momentum_cache[key] = fetch_yes_price_at(
-            yes_token_id, int(time.time()) - 24 * 3600
-        )
-    return _momentum_cache[key]
+    if key in _momentum_cache:
+        return _momentum_cache[key]
+    # Drop entries from previous hours; keep this hour's (shadow + live
+    # legs of several opportunities interleave within one cycle).
+    for stale in [k for k in _momentum_cache if k[1] != hour_bucket]:
+        del _momentum_cache[stale]
+    price = fetch_yes_price_at(yes_token_id, int(time.time()) - 24 * 3600)
+    if price is not None:  # don't cache failures — the other leg may succeed
+        _momentum_cache[key] = price
+    return price
 
 
 def execute_opportunity(
@@ -153,6 +161,12 @@ def execute_opportunity(
     """
     # Pick the actual token id we are buying (YES or NO).
     trade_token = opp.trade_token_id or opp.bucket.token_id
+
+    # Momentum lookup BEFORE any order goes out: this is a network call, and
+    # the fill→record window must stay I/O-free — a crash/preemption between
+    # a live fill and the DB insert leaves an untracked position (the inverse
+    # of the phantom-trade bug). Usually a cache hit from the shadow leg.
+    yes_price_24h_ago = _yes_price_24h_ago(opp.bucket.token_id)
 
     if shadow:
         # Shadow: full record, no real order — treated as dry_run at the CLOB layer
@@ -245,7 +259,7 @@ def execute_opportunity(
         {r.model_name: round(r.mean_f, 2) for r in model_results}
     ) if model_results else None
     trade_record = dict(
-        yes_price_24h_ago=_yes_price_24h_ago(opp.bucket.token_id),
+        yes_price_24h_ago=yes_price_24h_ago,
         model_means=model_means_json,
         ensemble_spread=getattr(opp.forecast, "std_f", None),
         market_id=opp.market.market_id,
@@ -329,6 +343,18 @@ def run_trading_cycle(
     if n_dup:
         logger.info(f"Skipped {n_dup} already-traded buckets (one bet per bucket)")
 
+    # Failed live orders leave NO trade row (by design — no phantoms), which
+    # means the dedup above cannot see them: without a cooldown a persistent
+    # failure (e.g. insufficient balance) re-orders and re-alerts every cycle.
+    # Slip-aborts are exempt — the book can genuinely improve next cycle.
+    now_ts = time.time()
+    cooled = [o for o in fresh
+              if now_ts - _order_failure_cooldown.get(_key(o), 0.0) < _FAILURE_COOLDOWN_S]
+    if cooled:
+        fresh = [o for o in fresh if o not in cooled]
+        logger.info(f"Skipped {len(cooled)} buckets in order-failure cooldown "
+                    f"({_FAILURE_COOLDOWN_S / 3600:.0f}h)")
+
     # Per-city daily cap — prevents concentration on a single city when the
     # scanner surfaces multiple correlated buckets in one pass. Applied before
     # the USDC quota so refused trades don't eat the daily budget.
@@ -391,8 +417,15 @@ def run_trading_cycle(
     executed: List[Opportunity] = []
     for opp in actionable:
         logger.info(f"Executing [{mode}]: {opp.summary()}")
-        execute_opportunity(opp, dry_run=dry_run, shadow=shadow)
-        executed.append(opp)
+        res = execute_opportunity(opp, dry_run=dry_run, shadow=shadow)
+        status = res.get("status") if isinstance(res, dict) else None
+        if status in ("placed", "shadow", "dry_run"):
+            executed.append(opp)
+        elif status != "slip_abort":
+            # error / rejected / unknown: no trade row exists, so start the
+            # re-entry cooldown; counting it as "deployed" would make the
+            # Telegram summary claim capital that never left the wallet.
+            _order_failure_cooldown[_key(opp)] = time.time()
 
     if executed:
         send_telegram(_daily_summary_alert(result, executed, mode=mode))
