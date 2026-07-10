@@ -664,12 +664,15 @@ def fetch_yes_price_at(token_id: str, ts_epoch: int) -> Optional[float]:
             )
             resp.raise_for_status()
             pts = resp.json().get("history", []) or []
-    except (httpx.HTTPError, ValueError) as e:
+        if not pts:
+            return None
+        # Parse inside the guard: this helper runs AFTER a live fill and
+        # before the trade row is written — an escaped KeyError/TypeError on
+        # a malformed point would leave a filled position with no DB record.
+        return float(pts[-1]["p"])
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as e:
         logger.warning(f"momentum price lookup failed for {token_id[:16]}…: {e}")
         return None
-    if not pts:
-        return None
-    return float(pts[-1]["p"])
 
 
 @http_retry

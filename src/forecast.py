@@ -355,27 +355,31 @@ class BiasStore:
         """
         Errors of the COMBINED ensemble mean, one value per (city, date).
 
-        Prefers rows tagged model='ensemble' (written since the 2026-07-10
-        recorder fix). Legacy rows duplicated the combined mean under every
-        model name, so averaging per (city, date) reproduces the combined
-        error exactly for old data — and blends per-model errors (a fine
-        proxy) for post-fix rows on days without an ensemble tag.
+        Merges both row generations per (city, date), ensemble rows winning:
+        rows tagged model='ensemble' (written since the 2026-07-10 recorder
+        fix) and legacy rows, which duplicated the combined mean under every
+        model name — averaging those per (city, date) reproduces the combined
+        error exactly. An all-or-nothing preference would let the FIRST
+        post-fix ensemble row hide months of legacy history (error_std → None,
+        EMOS stuck on KDE fallback until new rows accumulate).
         """
+        where_city = " AND city=?" if city else ""
+        args: tuple = (variable, city) if city else (variable,)
         with sqlite3.connect(self._db) as c:
-            where_city = " AND city=?" if city else ""
-            args: tuple = (variable, city) if city else (variable,)
-            rows = c.execute(
-                f"SELECT error FROM bias WHERE variable=? AND model='ensemble'{where_city}",
+            legacy = c.execute(
+                f"""SELECT city, target_date, AVG(error) FROM bias
+                    WHERE variable=? AND model!='ensemble'{where_city}
+                    GROUP BY city, target_date""",
                 args,
             ).fetchall()
-            if not rows:
-                rows = c.execute(
-                    f"""SELECT AVG(error) FROM bias
-                        WHERE variable=? AND model!='ensemble'{where_city}
-                        GROUP BY city, target_date""",
-                    args,
-                ).fetchall()
-        return [r[0] for r in rows if r[0] is not None]
+            ens = c.execute(
+                f"SELECT city, target_date, error FROM bias "
+                f"WHERE variable=? AND model='ensemble'{where_city}",
+                args,
+            ).fetchall()
+        merged = {(r[0], r[1]): r[2] for r in legacy}
+        merged.update({(r[0], r[1]): r[2] for r in ens})
+        return [v for v in merged.values() if v is not None]
 
     def error_std(self, variable: str = "temperature",
                   min_samples: int = MIN_DISPERSION_SAMPLES) -> Optional[float]:

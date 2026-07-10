@@ -97,6 +97,29 @@ def test_legacy_duplicated_rows_dedupe_via_avg(tmp_path: Path) -> None:
     assert len(errs) == 12
 
 
+def test_mixed_legacy_and_ensemble_rows_merge(tmp_path: Path) -> None:
+    # Regression: one post-fix 'ensemble' row must NOT hide legacy history
+    # (all-or-nothing preference would drop error_std to None right after
+    # deploy and silently pin EMOS to the KDE fallback for weeks).
+    store = BiasStore(tmp_path / "bias.db")
+    for i in range(20):  # 20 legacy days, triplicated like production data
+        for model in ("icon_seamless", "gfs_seamless", "ecmwf_ifs025"):
+            store.record(city="M", model=model, variable="temperature",
+                         target_date=date(2026, 6, 1 + i),
+                         forecast_mean=90.0, observed=90.0 + (2.0 if i % 2 else -2.0))
+    # one new-generation resolved trade
+    store.record(city="M", model="ensemble", variable="temperature",
+                 target_date=date(2026, 6, 25), forecast_mean=90.0, observed=91.0)
+    errs = store._combined_errors("temperature", city="M")
+    assert len(errs) == 21          # 20 legacy days + 1 ensemble day
+    assert store.error_std("temperature") is not None  # floor survives the transition
+    # ensemble row wins over legacy rows for the SAME date
+    store.record(city="M", model="icon_seamless", variable="temperature",
+                 target_date=date(2026, 6, 25), forecast_mean=80.0, observed=91.0)
+    errs2 = store._combined_errors("temperature", city="M")
+    assert len(errs2) == 21 and 1.0 in errs2  # still the ensemble error, not 11.0
+
+
 # ── bias recorder: per-model rows from model_means JSON ───────────────────────
 
 def test_recorder_writes_per_model_and_ensemble_rows(tmp_path: Path) -> None:
