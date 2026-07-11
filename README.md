@@ -40,6 +40,7 @@ our own shadow tape):
 |---|---|---|
 | **2026-07-12 → 14** | First paired live-vs-shadow read (n≈5–8) | Slippage staying ≤ ~2¢? Gross execution problems surface here |
 | **2026-07-21 → 25** | **Main verdict** (n≈15–25 pairs) | Pre-committed rule: skill ≥ ~4 pts AND cost ≤ ~3¢ → scale; skill-but-costly → rework execution; no skill → stop |
+| | **Pre-registered fallback (written 2026-07-11, before data):** at ~0.7 pairs/day the window may deliver only n≈8–12. Rule: the verdict fires at **n ≥ 20 resolved pairs OR 2026-08-01, whichever comes first** — no other extension, no threshold changes after seeing interim results. Early kill regardless of n: avg measured slippage > 4¢ over any 5 consecutive fills, or live drawdown > $60 cumulative. | Prevents post-hoc window/rule bending — the anti-pattern this table exists to stop |
 | **Late July** (if pass) | Flip `FORECAST_ENGINE=emos` at small size | Per-city error sigma replaces the global dispersion floor (validated out-of-sample: CRPS 0.955 vs 1.019); one change at a time |
 | **+1 week after flip** | Scale size (`MAX_TRADE_USDC` up) + market-anchored EV for Kelly | Our model's stated EV overstates true edge ~5–8×; sizing must use ask + measured skill |
 | **Early–mid Aug** | Momentum gate decision (3–4 wks of `yes_price_24h_ago` logs) | YES-fell buckets win NO 73–76% vs 67–68% — gate only if it stacks with model skill on our own tape |
