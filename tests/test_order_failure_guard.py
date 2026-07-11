@@ -49,6 +49,8 @@ def _run_live(tmp_path: Path, order_result: dict) -> tuple[dict, int]:
     with patch("src.trader._trade_store", store), \
          patch("src.trader.place_market_order", return_value=order_result), \
          patch("src.trader.send_telegram"), \
+         patch("src.trader.fetch_yes_price_at", return_value=None), \
+         patch("src.trader.fetch_book_depth", return_value=None), \
          patch("config.settings.settings.dry_run", False):
         result = execute_opportunity(_opportunity(), dry_run=False, quiet=True)
     n_rows = len(store.traded_bucket_keys())

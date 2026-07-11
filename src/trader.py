@@ -25,6 +25,7 @@ from rich.table import Table
 
 from config.settings import TRADES_DB, settings
 from src.polymarket_client import (
+    fetch_book_depth,
     fetch_market_resolutions,
     fetch_yes_price_at,
     place_market_order,
@@ -162,11 +163,14 @@ def execute_opportunity(
     # Pick the actual token id we are buying (YES or NO).
     trade_token = opp.trade_token_id or opp.bucket.token_id
 
-    # Momentum lookup BEFORE any order goes out: this is a network call, and
-    # the fill→record window must stay I/O-free — a crash/preemption between
-    # a live fill and the DB insert leaves an untracked position (the inverse
-    # of the phantom-trade bug). Usually a cache hit from the shadow leg.
+    # Momentum + book-depth lookups BEFORE any order goes out: these are
+    # network calls, and the fill→record window must stay I/O-free — a
+    # crash/preemption between a live fill and the DB insert leaves an
+    # untracked position (the inverse of the phantom-trade bug). Momentum is
+    # usually a cache hit from the shadow leg; depth is fetched per leg on
+    # purpose (the book moves between the shadow quote and the live order).
     yes_price_24h_ago = _yes_price_24h_ago(opp.bucket.token_id)
+    depth = fetch_book_depth(trade_token) or {}
 
     if shadow:
         # Shadow: full record, no real order — treated as dry_run at the CLOB layer
@@ -262,6 +266,8 @@ def execute_opportunity(
         yes_price_24h_ago=yes_price_24h_ago,
         model_means=model_means_json,
         ensemble_spread=getattr(opp.forecast, "std_f", None),
+        book_bid_depth=depth.get("bid_depth_usdc"),
+        book_ask_depth=depth.get("ask_depth_usdc"),
         market_id=opp.market.market_id,
         condition_id=opp.bucket.condition_id,
         token_id=trade_token,

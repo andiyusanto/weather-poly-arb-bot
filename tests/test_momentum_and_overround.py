@@ -76,16 +76,19 @@ def test_overround_wide_spread_book_is_not_an_arb() -> None:
 
 # ── momentum logging on trade records ─────────────────────────────────────────
 
-def _record_shadow(tmp_path: Path, momentum_price) -> sqlite3.Row:
+def _record_shadow(tmp_path: Path, momentum_price,
+                   depth={"bid_depth_usdc": 42.5, "ask_depth_usdc": 17.0}) -> sqlite3.Row:
     _momentum_cache.clear()
     store = TradeStore(tmp_path / "trades.db")
     with patch("src.trader._trade_store", store), \
          patch("src.trader.send_telegram"), \
+         patch("src.trader.fetch_book_depth", return_value=depth) as fbd, \
          patch("src.trader.fetch_yes_price_at", return_value=momentum_price) as fyp:
         execute_opportunity(_opportunity(_market([0.55, 0.3, 0.1])),
                             dry_run=False, shadow=True, quiet=True)
         fyp.assert_called_once()  # called with the YES token, once
         assert fyp.call_args[0][0] == "y0"
+        fbd.assert_called_once_with("n0")  # depth on the TRADED (NO) token
     with sqlite3.connect(store._db) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute("SELECT * FROM trades").fetchone()
@@ -102,6 +105,18 @@ def test_momentum_lookup_failure_records_null(tmp_path: Path) -> None:
     assert row["yes_price_24h_ago"] is None  # best-effort: NULL, trade still recorded
 
 
+def test_book_depth_recorded(tmp_path: Path) -> None:
+    row = _record_shadow(tmp_path, 0.48)
+    assert row["book_bid_depth"] == 42.5
+    assert row["book_ask_depth"] == 17.0
+
+
+def test_book_depth_failure_records_null(tmp_path: Path) -> None:
+    row = _record_shadow(tmp_path, 0.48, depth=None)
+    assert row["book_bid_depth"] is None  # best-effort: NULL, trade still recorded
+    assert row["book_ask_depth"] is None
+
+
 def test_momentum_cached_across_shadow_and_live_legs(tmp_path: Path) -> None:
     _momentum_cache.clear()
     store = TradeStore(tmp_path / "trades.db")
@@ -112,10 +127,12 @@ def test_momentum_cached_across_shadow_and_live_legs(tmp_path: Path) -> None:
                return_value={"status": "placed", "order_id": "0x1",
                              "fill_price": 0.56, "size_usdc": 2.8}), \
          patch("config.settings.settings.dry_run", False), \
+         patch("src.trader.fetch_book_depth", return_value=None) as fbd, \
          patch("src.trader.fetch_yes_price_at", return_value=0.48) as fyp:
         execute_opportunity(_opportunity(m), dry_run=False, shadow=True, quiet=True)
         execute_opportunity(_opportunity(m), dry_run=False, quiet=True)
         fyp.assert_called_once()  # second leg served from cache
+        assert fbd.call_count == 2  # depth is per-leg on purpose (book moves)
     with sqlite3.connect(store._db) as conn:
         vals = [r[0] for r in conn.execute("SELECT yes_price_24h_ago FROM trades")]
     assert vals == [0.48, 0.48]

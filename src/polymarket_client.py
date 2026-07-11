@@ -675,6 +675,38 @@ def fetch_yes_price_at(token_id: str, ts_epoch: int) -> Optional[float]:
         return None
 
 
+def fetch_book_depth(token_id: str) -> Optional[Dict[str, float]]:
+    """
+    Top-of-book depth for one token from the public CLOB /book endpoint.
+
+    Returns ``{"bid_depth_usdc": ..., "ask_depth_usdc": ...}`` — price × size
+    at the best bid/ask of the given token — or None on any failure. Logged
+    on trade records so scale-up sizing can be liquidity-aware (cap orders at
+    a fraction of displayed depth) instead of blind Kelly; also validates
+    whether overround alerts are actually fillable. Best-effort: must never
+    block or crash trading.
+    """
+    if not token_id:
+        return None
+    try:
+        with httpx.Client(timeout=10) as client:
+            resp = client.get(f"{settings.clob_host}/book",
+                              params={"token_id": token_id})
+            resp.raise_for_status()
+            book = resp.json()
+        bids = [(float(x["price"]), float(x["size"])) for x in book.get("bids", [])]
+        asks = [(float(x["price"]), float(x["size"])) for x in book.get("asks", [])]
+        best_bid = max(bids, key=lambda t: t[0]) if bids else None
+        best_ask = min(asks, key=lambda t: t[0]) if asks else None
+        return {
+            "bid_depth_usdc": round(best_bid[0] * best_bid[1], 2) if best_bid else 0.0,
+            "ask_depth_usdc": round(best_ask[0] * best_ask[1], 2) if best_ask else 0.0,
+        }
+    except (httpx.HTTPError, ValueError, KeyError, TypeError, AttributeError) as e:
+        logger.warning(f"book depth lookup failed for {token_id[:16]}…: {e}")
+        return None
+
+
 @http_retry
 def fetch_live_prices(token_ids: List[str]) -> Dict[str, Dict[str, float]]:
     """
