@@ -362,24 +362,41 @@ class BiasStore:
             ).fetchall()
         return float(np.mean([r[0] for r in rows])) if rows else 0.0
 
-    def _combined_errors(self, variable: str, city: Optional[str] = None) -> List[float]:
+    def _combined_errors(self, variable: str, city: Optional[str] = None,
+                         source: str = "om") -> List[float]:
         """
         Errors of the COMBINED ensemble mean, one value per (city, date).
 
-        Merges both row generations per (city, date), ensemble rows winning:
-        rows tagged model='ensemble' (written since the 2026-07-10 recorder
-        fix) and legacy rows, which duplicated the combined mean under every
-        model name — averaging those per (city, date) reproduces the combined
-        error exactly. An all-or-nothing preference would let the FIRST
-        post-fix ensemble row hide months of legacy history (error_std → None,
-        EMOS stuck on KDE fallback until new rows accumulate).
+        ``source`` picks the ground truth:
+          "om"      — Open-Meteo grid observations: rows tagged
+                      model='ensemble' merged with legacy rows (which
+                      duplicated the combined mean under every model name;
+                      averaging per (city, date) reproduces the combined
+                      error exactly). model='station' rows are EXCLUDED.
+          "station" — settlement-station METAR observations (model='station'
+                      rows, recorded in parallel since 2026-07-11). The
+                      2026-07-11 audit showed OM lands in the winning bucket
+                      only 26% of the time — station rows measure error
+                      against the quantity that actually pays.
+
+        Merging is per (city, date) with ensemble rows winning over legacy:
+        an all-or-nothing preference would let the FIRST post-fix ensemble
+        row hide months of legacy history (error_std → None, EMOS stuck on
+        the KDE fallback until new rows accumulate).
         """
         where_city = " AND city=?" if city else ""
         args: tuple = (variable, city) if city else (variable,)
         with sqlite3.connect(self._db) as c:
+            if source == "station":
+                rows = c.execute(
+                    f"SELECT city, target_date, error FROM bias "
+                    f"WHERE variable=? AND model='station'{where_city}",
+                    args,
+                ).fetchall()
+                return [r[2] for r in rows if r[2] is not None]
             legacy = c.execute(
                 f"""SELECT city, target_date, AVG(error) FROM bias
-                    WHERE variable=? AND model!='ensemble'{where_city}
+                    WHERE variable=? AND model NOT IN ('ensemble','station'){where_city}
                     GROUP BY city, target_date""",
                 args,
             ).fetchall()
@@ -393,33 +410,43 @@ class BiasStore:
         return [v for v in merged.values() if v is not None]
 
     def error_std(self, variable: str = "temperature",
-                  min_samples: int = MIN_DISPERSION_SAMPLES) -> Optional[float]:
+                  min_samples: int = MIN_DISPERSION_SAMPLES,
+                  source: str = "om") -> Optional[float]:
         """
         Global std of realized combined-mean forecast errors — the floor the
         forecast spread should not undercut. Returns None if too few samples.
+        source='station' falls back to 'om' while station history is thin.
         """
-        errs = self._combined_errors(variable)
+        errs = self._combined_errors(variable, source=source)
+        if len(errs) < min_samples and source == "station":
+            errs = self._combined_errors(variable, source="om")
         if len(errs) < min_samples:
             return None
         return float(np.std(errs))
 
     def city_error_sigma(self, city: str, variable: str = "temperature",
                          shrink_k: int = 10,
-                         min_global: int = MIN_DISPERSION_SAMPLES) -> Optional[float]:
+                         min_global: int = MIN_DISPERSION_SAMPLES,
+                         source: str = "om") -> Optional[float]:
         """
         Per-city predictive sigma for the EMOS engine, shrunk toward the
         global error std by w = n/(n+k). Per-city stds ranged 1.0–3.8°F on
         2026-07-10, so a single global sigma is wrong in both directions:
         underconfident in tight cities, overconfident in volatile ones.
 
-        Returns None when even the global history is too thin — callers must
+        source='station' measures against settlement-station ground truth and
+        silently falls back to 'om' while the station history is too thin.
+        Returns None when even the OM history is too thin — callers must
         fall back to the KDE/dispersion-floor path.
         """
-        all_errs = self._combined_errors(variable)
+        all_errs = self._combined_errors(variable, source=source)
+        if len(all_errs) < min_global and source == "station":
+            source = "om"
+            all_errs = self._combined_errors(variable, source=source)
         if len(all_errs) < min_global:
             return None
         g_var = float(np.var(all_errs))
-        city_errs = self._combined_errors(variable, city=city)
+        city_errs = self._combined_errors(variable, city=city, source=source)
         n = len(city_errs)
         if n < 2:
             return float(np.sqrt(g_var))
@@ -660,7 +687,8 @@ def get_ensemble_forecast(
     # otherwise dumps ~90%+ mass onto a single-degree bucket. Floor is fit from the
     # bias table once enough errors exist, else a conservative default.
     if use_bias_correction:
-        floor = _bias_store.error_std("temperature") or _DEFAULT_DISPERSION_F
+        floor = (_bias_store.error_std("temperature", source=settings.ground_truth_source)
+                 or _DEFAULT_DISPERSION_F)
         pre_std = float(np.std(all_weighted))
         all_weighted = _inflate_dispersion(all_weighted, floor)
         post_std = float(np.std(all_weighted))
@@ -693,7 +721,7 @@ def get_ensemble_forecast(
     # Falls back to KDE silently when the bias history is too thin to fit.
     engine = "kde"
     if settings.forecast_engine == "emos":
-        sigma = _bias_store.city_error_sigma(city)
+        sigma = _bias_store.city_error_sigma(city, source=settings.ground_truth_source)
         if sigma is not None:
             result.emos_sigma_f = max(sigma, 0.8)  # never sharper than 0.8°F
             engine = "emos"

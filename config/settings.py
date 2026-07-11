@@ -154,6 +154,14 @@ class Settings(BaseSettings):
     # Do not flip to "emos" mid-experiment — wait for the live/shadow verdict.
     forecast_engine: str = "kde"
 
+    # Ground truth for bias/sigma fitting: "om" (Open-Meteo grid, legacy) or
+    # "station" (settlement-station METAR, recorded in parallel since
+    # 2026-07-11 — the audit showed OM lands in the winning bucket only 26%
+    # of the time). Station rows warm up alongside OM rows; flip AFTER the
+    # verdict window, together with the EMOS engine. Falls back to "om"
+    # automatically while station history is too thin.
+    ground_truth_source: str = "om"
+
     # ── Overround alert ──────────────────────────────────────────────────────
     # Alert (Telegram + WARNING log) when an event's YES asks sum to at least
     # this value: every bucket is overpriced, so buying NO across all of them

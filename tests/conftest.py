@@ -33,6 +33,7 @@ _PINNED_DEFAULTS = {
     "city_blacklist": "",
     # Forecast engine: legacy KDE unless a test opts into EMOS explicitly
     "forecast_engine": "kde",
+    "ground_truth_source": "om",
 }
 
 

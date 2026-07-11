@@ -150,6 +150,29 @@ def record_bias_for_resolved_trade(trade: dict) -> bool:
             city=city, model="ensemble", variable=variable, target_date=target,
             forecast_mean=float(forecast_mean), observed=float(observed),
         )
+        # Parallel SETTLEMENT ground truth (model='station'): the same combined
+        # mean scored against the named airport station's METAR daily max —
+        # what the market actually settles on. Written alongside the OM row so
+        # the corrected bias/sigma tables warm up without touching live
+        # probabilities; GROUND_TRUTH_SOURCE=station flips consumers later.
+        # (Temperature only — no station mapping for other variables.)
+        if variable == "temperature":
+            from src.station_obs import fetch_station_daily_max_f, station_for_city
+            icao = station_for_city(city)
+            tz = geo.get("timezone") or ""
+            if icao and tz:
+                st_obs = fetch_station_daily_max_f(icao, target, tz)
+                if st_obs is not None:
+                    _bias_store.record(
+                        city=city, model="station", variable=variable,
+                        target_date=target, forecast_mean=float(forecast_mean),
+                        observed=float(st_obs),
+                    )
+                    logger.info(
+                        f"station bias recorded {city}/{icao} {target}: "
+                        f"station={st_obs:.2f} vs om={observed:.2f} "
+                        f"(Δ={st_obs - observed:+.2f})"
+                    )
 
     # Per-model rows: use each model's OWN mean when the trade carried it
     # (model_means JSON, recorded since 2026-07-10). Before that fix the
