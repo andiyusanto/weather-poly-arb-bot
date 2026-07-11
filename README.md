@@ -13,7 +13,103 @@ The bot fetches multi-model ensemble forecasts, computes calibrated bucket proba
 
 ---
 
+## Current Status & Roadmap (updated 2026-07-10)
+
+**Where we are:** live on the deposit-wallet (SDK) path with a deliberately tight
+funnel — NO-side only, ask 0.50–0.80, EV ≥ 0.35, 2¢ pre-order slip cap,
+6-city allowlist, $20/day cap (~1 qualified trade/day). Every live trade gets a
+**parallel shadow control row** recorded at the scan quote, so execution cost
+(slippage + fee) can be separated from model skill.
+
+**What the data says so far** (90-day historical study, 175k price samples +
+our own shadow tape):
+
+- The market itself is **efficient to ~1–2¢** at every price decile — there is
+  no price-band edge. Buying every NO at 0.50–0.80 loses ≈ fee+slip.
+- The only edge is **forecast selection skill**: our June picks won **+2–4 pts**
+  above what their entry prices implied (~+5–9% gross ROI), against a ~4–5%
+  cost stack. Knife-edge — execution discipline decides the sign.
+- Cheap YES longshots (0.10–0.30) are systematically overpriced (buying them
+  loses 17–21%) — the NO-only rule is retro-confirmed.
+- City price-history tables are noise; the allowlist is justified only by our
+  model's per-city skill, not by market data.
+
+### Timeline
+
+| When | Milestone | Decision it makes |
+|---|---|---|
+| **2026-07-12 → 14** | First paired live-vs-shadow read (n≈5–8) | Slippage staying ≤ ~2¢? Gross execution problems surface here |
+| **2026-07-21 → 25** | **Main verdict** (n≈15–25 pairs) | Pre-committed rule: skill ≥ ~4 pts AND cost ≤ ~3¢ → scale; skill-but-costly → rework execution; no skill → stop |
+| **Late July** (if pass) | Flip `FORECAST_ENGINE=emos` at small size | Per-city error sigma replaces the global dispersion floor (validated out-of-sample: CRPS 0.955 vs 1.019); one change at a time |
+| **+1 week after flip** | Scale size (`MAX_TRADE_USDC` up) + market-anchored EV for Kelly | Our model's stated EV overstates true edge ~5–8×; sizing must use ask + measured skill |
+| **Early–mid Aug** | Momentum gate decision (3–4 wks of `yes_price_24h_ago` logs) | YES-fell buckets win NO 73–76% vs 67–68% — gate only if it stacks with model skill on our own tape |
+| **Mid Aug** | BMA model weights + spread-conditional EMOS (4 wks of per-model bias rows) | Replace hardcoded ECMWF/ICON/GFS/GEM weights with fitted ones |
+| **After** | Nowcast layer (running observed max for <18h markets) | The one engine that can create edge the market doesn't already price |
+
+**Standing rules while the experiment runs:** don't touch the funnel settings
+mid-window, keep the deposit wallet ≥ ~$25 (the exchange 5-share minimum makes
+every order ~$2–3.40), and treat `❌ LIVE order failed` alerts as informational
+(a 3h re-entry cooldown handles retries).
+
+---
+
+## Changelog — July 2026 hardening sprint
+
+**Data integrity & execution safety**
+- **Failed-order guard**: live orders that error/reject are no longer recorded
+  as filled trades. (Two phantom "wins" from a killed FOK and an
+  insufficient-balance reject were corrupting the live tape by +$3.66; purged
+  via `scripts/purge_phantom_trades.py`.)
+- **Failure cooldown**: failed live orders start a 3h re-entry cooldown (no DB
+  row means dedup can't see them — previously a persistent failure re-ordered
+  and re-alerted every 30-min cycle) and no longer count as "deployed" in the
+  cycle summary.
+- **Fill→record window is I/O-free**: the momentum lookup runs before order
+  placement, so a crash/spot-preemption can't leave a filled position with no
+  DB row.
+
+**Instrumentation (additive — funnel untouched)**
+- **Parallel shadow control**: in live mode every qualified opportunity is also
+  recorded as a quiet shadow row (own dedup namespace) — the control group for
+  measuring execution cost.
+- **Momentum logging**: every trade row stores `yes_price_24h_ago` (hourly CLOB
+  price history, cached per cycle, best-effort NULL on failure).
+- **Overround alert**: Telegram alert when an event's **YES bids** sum ≥ 1.10 —
+  a structural all-NO arb (historical slice: +17.2% ROI, ~1% of event-days).
+  Alert-only; verify live books before trading manually.
+- **Per-model bias recording**: trade rows carry `model_means` JSON +
+  `ensemble_spread`; resolution writes each model's own error (previously the
+  combined mean was duplicated under every model name, making per-model bias a
+  no-op and BMA weights unfittable). Same-day trades skip the ensemble sigma
+  row (intraday-clamped means would self-sharpen the EMOS sigma).
+
+**Forecast engines**
+- **EMOS-lite engine** behind `FORECAST_ENGINE=kde|emos` (default `kde`):
+  Gaussian at the bias-corrected ensemble mean with per-city climatological
+  error σ (shrunk toward global), censored at the intraday max-so-far on
+  same-day markets. Validated out-of-sample on 733 city-days: CRPS 0.955 vs
+  1.019, bucket log-score −1.391 vs −1.517. Falls back to KDE when bias
+  history is thin. **Do not flip mid-experiment.**
+
+**Research tooling**
+- `scripts/fetch_history.py`: resolved weather markets + hourly price series →
+  SQLite (49k buckets, 2.2M points over 90 days). Handles Gamma's ~2000-offset
+  cap (end-date windowing), CLOB's `interval=max` emptiness on old markets
+  (explicit `startTs/endTs`), Cloudflare TCP-reset throttling (long backoff),
+  and ISP DNS hijack (DoH-pinned sessions, ported from Signal-Edge-Finder).
+- `scripts/analyze_history.py`: segment-calibration study with pre-registered
+  primary hypothesis, monthly train/holdout split, and 0/2/5¢ cost sensitivity.
+  Null-validated on synthetic efficient-market data.
+
+---
+
 ## The Edge
+
+> **⚠️ Superseded (2026-07-10):** the section below reflects the original
+> thesis. The 90-day historical study (see *Current Status* above) showed the
+> market is efficient to ~1–2¢ at the price level — the edge, where it exists,
+> comes from forecast selection skill and execution discipline, not from
+> systematic retail mispricing. Kept for context; trust the numbers above.
 
 Polymarket weather markets are priced by retail traders, not meteorologists. This creates persistent mispricings in all four categories:
 
