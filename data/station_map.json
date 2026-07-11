@@ -1,0 +1,266 @@
+{
+ "_meta": {
+  "source": "Wunderground URL in Gamma market descriptions",
+  "updated": "2026-07-11T07:55:16+00:00"
+ },
+ "amsterdam": {
+  "city": "Amsterdam",
+  "icao": "EHAM",
+  "sample_question": "Will the highest temperature in Amsterdam be 22\u00b0C or below on July 11?"
+ },
+ "ankara": {
+  "city": "Ankara",
+  "icao": "LTAC",
+  "sample_question": "Will the highest temperature in Ankara be 25\u00b0C or below on July 11?"
+ },
+ "atlanta": {
+  "city": "Atlanta",
+  "icao": "KATL",
+  "sample_question": "Will the highest temperature in Atlanta be 81\u00b0F or below on July 11?"
+ },
+ "austin": {
+  "city": "Austin",
+  "icao": "KAUS",
+  "sample_question": "Will the highest temperature in Austin be 87\u00b0F or below on July 11?"
+ },
+ "beijing": {
+  "city": "Beijing",
+  "icao": "ZBAA",
+  "sample_question": "Will the highest temperature in Beijing be 27\u00b0C or below on July 11?"
+ },
+ "buenos aires": {
+  "city": "Buenos Aires",
+  "icao": "SAEZ",
+  "sample_question": "Will the highest temperature in Buenos Aires be 8\u00b0C or below on July 11?"
+ },
+ "busan": {
+  "city": "Busan",
+  "icao": "RKPK",
+  "sample_question": "Will the highest temperature in Busan be 27\u00b0C or below on July 11?"
+ },
+ "cape town": {
+  "city": "Cape Town",
+  "icao": "FACT",
+  "sample_question": "Will the highest temperature in Cape Town be 13\u00b0C or below on July 11?"
+ },
+ "chengdu": {
+  "city": "Chengdu",
+  "icao": "ZUUU",
+  "sample_question": "Will the highest temperature in Chengdu be 28\u00b0C or below on July 11?"
+ },
+ "chicago": {
+  "city": "Chicago",
+  "icao": "KORD",
+  "sample_question": "Will the highest temperature in Chicago be 77\u00b0F or below on July 11?"
+ },
+ "chongqing": {
+  "city": "Chongqing",
+  "icao": "ZUCK",
+  "sample_question": "Will the highest temperature in Chongqing be 32\u00b0C or below on July 11?"
+ },
+ "dallas": {
+  "city": "Dallas",
+  "icao": "KDAL",
+  "sample_question": "Will the highest temperature in Dallas be 93\u00b0F or below on July 11?"
+ },
+ "denver": {
+  "city": "Denver",
+  "icao": "KBKF",
+  "sample_question": "Will the highest temperature in Denver be 87\u00b0F or below on July 11?"
+ },
+ "guangzhou": {
+  "city": "Guangzhou",
+  "icao": "ZGGG",
+  "sample_question": "Will the highest temperature in Guangzhou be 31\u00b0C or below on July 11?"
+ },
+ "helsinki": {
+  "city": "Helsinki",
+  "icao": "EFHK",
+  "sample_question": "Will the highest temperature in Helsinki be 19\u00b0C or below on July 11?"
+ },
+ "houston": {
+  "city": "Houston",
+  "icao": "KHOU",
+  "sample_question": "Will the highest temperature in Houston be 81\u00b0F or below on July 11?"
+ },
+ "istanbul": {
+  "city": "Istanbul",
+  "icao": "LTFM",
+  "sample_question": "Will the highest temperature in Istanbul be 22\u00b0C or below on July 11?"
+ },
+ "jakarta": {
+  "city": "Jakarta",
+  "icao": "WIHH",
+  "sample_question": "Will the highest temperature in Jakarta be 29\u00b0C or below on April 27?"
+ },
+ "jeddah": {
+  "city": "Jeddah",
+  "icao": "OEJN",
+  "sample_question": "Will the highest temperature in Jeddah be 34\u00b0C or below on July 11?"
+ },
+ "jinan": {
+  "city": "Jinan",
+  "icao": "ZSJN",
+  "sample_question": "Will the highest temperature in Jinan be 15\u00b0C or below on May 20?"
+ },
+ "karachi": {
+  "city": "Karachi",
+  "icao": "OPKC",
+  "sample_question": "Will the highest temperature in Karachi be 25\u00b0C or below on July 11?"
+ },
+ "kuala lumpur": {
+  "city": "Kuala Lumpur",
+  "icao": "WMKK",
+  "sample_question": "Will the highest temperature in Kuala Lumpur be 25\u00b0C or below on July 11?"
+ },
+ "lagos": {
+  "city": "Lagos",
+  "icao": "DNMM",
+  "sample_question": "Will the highest temperature in Lagos be 27\u00b0C or below on April 27?"
+ },
+ "london": {
+  "city": "London",
+  "icao": "EGLC",
+  "sample_question": "Will the highest temperature in London be 24\u00b0C or below on July 11?"
+ },
+ "los angeles": {
+  "city": "Los Angeles",
+  "icao": "KLAX",
+  "sample_question": "Will the highest temperature in Los Angeles be 73\u00b0F or below on July 10?"
+ },
+ "lucknow": {
+  "city": "Lucknow",
+  "icao": "VILK",
+  "sample_question": "Will the highest temperature in Lucknow be 29\u00b0C or below on July 11?"
+ },
+ "madrid": {
+  "city": "Madrid",
+  "icao": "LEMD",
+  "sample_question": "Will the highest temperature in Madrid be 33\u00b0C or below on July 11?"
+ },
+ "manila": {
+  "city": "Manila",
+  "icao": "RPLL",
+  "sample_question": "Will the highest temperature in Manila be 24\u00b0C or below on July 11?"
+ },
+ "mexico city": {
+  "city": "Mexico City",
+  "icao": "MMMX",
+  "sample_question": "Will the highest temperature in Mexico City be 18\u00b0C or below on July 11?"
+ },
+ "miami": {
+  "city": "Miami",
+  "icao": "KMIA",
+  "sample_question": "Will the highest temperature in Miami be 81\u00b0F or below on July 11?"
+ },
+ "milan": {
+  "city": "Milan",
+  "icao": "LIMC",
+  "sample_question": "Will the highest temperature in Milan be 25\u00b0C or below on July 11?"
+ },
+ "moscow": {
+  "city": "Moscow",
+  "icao": "UUWW",
+  "sample_question": "Will the highest temperature in Moscow be 18\u00b0C or below on July 11?"
+ },
+ "munich": {
+  "city": "Munich",
+  "icao": "EDDM",
+  "sample_question": "Will the highest temperature in Munich be 23\u00b0C or below on July 11?"
+ },
+ "new york city": {
+  "city": "New York City",
+  "icao": "KLGA",
+  "sample_question": "Will the highest temperature in New York City be 69\u00b0F or below on July 11?"
+ },
+ "panama city": {
+  "city": "Panama City",
+  "icao": "MPMG",
+  "sample_question": "Will the highest temperature in Panama City be 25\u00b0C or below on July 11?"
+ },
+ "paris": {
+  "city": "Paris",
+  "icao": "LFPB",
+  "sample_question": "Will the highest temperature in Paris be 29\u00b0C or below on July 11?"
+ },
+ "qingdao": {
+  "city": "Qingdao",
+  "icao": "ZSQD",
+  "sample_question": "Will the highest temperature in Qingdao be 22\u00b0C or below on July 11?"
+ },
+ "san francisco": {
+  "city": "San Francisco",
+  "icao": "KSFO",
+  "sample_question": "Will the highest temperature in San Francisco be 59\u00b0F or below on July 10?"
+ },
+ "sao paulo": {
+  "city": "Sao Paulo",
+  "icao": "SBGR",
+  "sample_question": "Will the highest temperature in Sao Paulo be 22\u00b0C or below on July 11?"
+ },
+ "seattle": {
+  "city": "Seattle",
+  "icao": "KSEA",
+  "sample_question": "Will the highest temperature in Seattle be 63\u00b0F or below on July 10?"
+ },
+ "seoul": {
+  "city": "Seoul",
+  "icao": "RKSI",
+  "sample_question": "Will the highest temperature in Seoul be 23\u00b0C or below on July 11?"
+ },
+ "shanghai": {
+  "city": "Shanghai",
+  "icao": "ZSPD",
+  "sample_question": "Will the highest temperature in Shanghai be 26\u00b0C or below on July 11?"
+ },
+ "shenzhen": {
+  "city": "Shenzhen",
+  "icao": "ZGSZ",
+  "sample_question": "Will the highest temperature in Shenzhen be 29\u00b0C or below on July 11?"
+ },
+ "singapore": {
+  "city": "Singapore",
+  "icao": "WSSS",
+  "sample_question": "Will the highest temperature in Singapore be 25\u00b0C or below on July 11?"
+ },
+ "taipei": {
+  "city": "Taipei",
+  "icao": "RCSS",
+  "sample_question": "Will the highest temperature in Taipei be 22\u00b0C or below on July 11?"
+ },
+ "tel aviv": {
+  "city": "Tel Aviv",
+  "icao": "LLBG",
+  "sample_question": "Will the highest temperature in Tel Aviv be 28\u00b0C or below on July 11?"
+ },
+ "tokyo": {
+  "city": "Tokyo",
+  "icao": "RJTT",
+  "sample_question": "Will the highest temperature in Tokyo be 26\u00b0C or below on July 11?"
+ },
+ "toronto": {
+  "city": "Toronto",
+  "icao": "CYYZ",
+  "sample_question": "Will the highest temperature in Toronto be 23\u00b0C or below on July 11?"
+ },
+ "warsaw": {
+  "city": "Warsaw",
+  "icao": "EPWA",
+  "sample_question": "Will the highest temperature in Warsaw be 18\u00b0C or below on July 11?"
+ },
+ "wellington": {
+  "city": "Wellington",
+  "icao": "NZWN",
+  "sample_question": "Will the highest temperature in Wellington be 5\u00b0C or below on July 11?"
+ },
+ "wuhan": {
+  "city": "Wuhan",
+  "icao": "ZHHH",
+  "sample_question": "Will the highest temperature in Wuhan be 31\u00b0C or below on July 11?"
+ },
+ "zhengzhou": {
+  "city": "Zhengzhou",
+  "icao": "ZHCC",
+  "sample_question": "Will the highest temperature in Zhengzhou be 14\u00b0C or below on May 20?"
+ }
+}

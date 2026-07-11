@@ -1,0 +1,205 @@
+{
+ "Amsterdam": {
+  "n": 64,
+  "offset_f": 0.42
+ },
+ "Ankara": {
+  "n": 64,
+  "offset_f": 0.56
+ },
+ "Atlanta": {
+  "n": 60,
+  "offset_f": 0.74
+ },
+ "Austin": {
+  "n": 61,
+  "offset_f": -1.64
+ },
+ "Beijing": {
+  "n": 65,
+  "offset_f": 0.39
+ },
+ "Buenos Aires": {
+  "n": 63,
+  "offset_f": 2.21
+ },
+ "Busan": {
+  "n": 65,
+  "offset_f": 2.35
+ },
+ "Cape Town": {
+  "n": 61,
+  "offset_f": 1.82
+ },
+ "Chengdu": {
+  "n": 65,
+  "offset_f": 2.07
+ },
+ "Chicago": {
+  "n": 61,
+  "offset_f": 0.17
+ },
+ "Chongqing": {
+  "n": 65,
+  "offset_f": 0.61
+ },
+ "Dallas": {
+  "n": 61,
+  "offset_f": -1.71
+ },
+ "Denver": {
+  "n": 61,
+  "offset_f": -4.07
+ },
+ "Guangzhou": {
+  "n": 64,
+  "offset_f": 3.33
+ },
+ "Helsinki": {
+  "n": 64,
+  "offset_f": 1.66
+ },
+ "Hong Kong": {
+  "n": 64,
+  "offset_f": 2.27
+ },
+ "Houston": {
+  "n": 61,
+  "offset_f": 0.46
+ },
+ "Istanbul": {
+  "n": 64,
+  "offset_f": -1.56
+ },
+ "Jeddah": {
+  "n": 64,
+  "offset_f": 0.84
+ },
+ "Karachi": {
+  "n": 64,
+  "offset_f": 4.32
+ },
+ "Kuala Lumpur": {
+  "n": 65,
+  "offset_f": 0.59
+ },
+ "London": {
+  "n": 64,
+  "offset_f": 0.65
+ },
+ "Los Angeles": {
+  "n": 61,
+  "offset_f": -6.9
+ },
+ "Lucknow": {
+  "n": 64,
+  "offset_f": 1.65
+ },
+ "Madrid": {
+  "n": 64,
+  "offset_f": 2.17
+ },
+ "Manila": {
+  "n": 65,
+  "offset_f": 1.88
+ },
+ "Mexico City": {
+  "n": 64,
+  "offset_f": -0.12
+ },
+ "Miami": {
+  "n": 61,
+  "offset_f": 1.65
+ },
+ "Milan": {
+  "n": 64,
+  "offset_f": -0.35
+ },
+ "Moscow": {
+  "n": 64,
+  "offset_f": 0.77
+ },
+ "Munich": {
+  "n": 64,
+  "offset_f": 1.35
+ },
+ "New York City": {
+  "n": 61,
+  "offset_f": 0.15
+ },
+ "Panama City": {
+  "n": 63,
+  "offset_f": 1.62
+ },
+ "Paris": {
+  "n": 64,
+  "offset_f": 0.49
+ },
+ "Qingdao": {
+  "n": 65,
+  "offset_f": 4.35
+ },
+ "San Francisco": {
+  "n": 61,
+  "offset_f": 0.37
+ },
+ "Sao Paulo": {
+  "n": 62,
+  "offset_f": 1.73
+ },
+ "Seattle": {
+  "n": 60,
+  "offset_f": -0.62
+ },
+ "Seoul": {
+  "n": 65,
+  "offset_f": -1.47
+ },
+ "Shanghai": {
+  "n": 65,
+  "offset_f": -1.13
+ },
+ "Shenzhen": {
+  "n": 64,
+  "offset_f": 1.72
+ },
+ "Singapore": {
+  "n": 65,
+  "offset_f": 1.49
+ },
+ "Taipei": {
+  "n": 65,
+  "offset_f": 2.34
+ },
+ "Tel Aviv": {
+  "n": 64,
+  "offset_f": 2.91
+ },
+ "Tokyo": {
+  "n": 65,
+  "offset_f": 0.64
+ },
+ "Toronto": {
+  "n": 61,
+  "offset_f": 3.14
+ },
+ "Warsaw": {
+  "n": 64,
+  "offset_f": 1.17
+ },
+ "Wellington": {
+  "n": 65,
+  "offset_f": 2.2
+ },
+ "Wuhan": {
+  "n": 64,
+  "offset_f": 1.1
+ },
+ "_meta": {
+  "audited": "2026-07-11",
+  "desc": "settlement(winner-mid) minus Open-Meteo observed, F; shrunk n/(n+8) to global",
+  "events": 3104,
+  "global_offset_f": 0.85,
+  "residual_std_after_offset_f": 2.41
+ }
+}

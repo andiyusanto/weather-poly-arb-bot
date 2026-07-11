@@ -419,14 +419,15 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--days", type=int, default=90, help="history window (default 90)")
     ap.add_argument("--skip-prices", action="store_true", help="phase 1 only")
+    ap.add_argument("--db", default=str(DB_PATH), help="SQLite output path")
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="cap phase-2 series (bounded test run)")
     args = ap.parse_args()
 
     init_network()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(args.db)
     conn.executescript(SCHEMA)
-    print(f"DB: {DB_PATH}")
+    print(f"DB: {args.db}")
 
     fetch_buckets(conn, args.days)
     refresh_unresolved(conn)
