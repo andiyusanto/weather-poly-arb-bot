@@ -99,3 +99,15 @@ def test_resolve_tolerates_missing_observation(tmp_path: Path) -> None:
          patch.object(br._geo, "get", side_effect=_geo_stub), \
          patch.object(br, "_fetch_observed", return_value=None):
         assert br.resolve_forecast_logs() == 0  # stays pending for a later pass
+
+
+def test_snapshot_all_cities_includes_station_mapped(tmp_path: Path) -> None:
+    store = BiasStore(tmp_path / "b.db")
+    with patch.object(br, "_bias_store", store), \
+         patch.object(br._geo, "get", side_effect=_geo_stub), \
+         patch.object(settings, "city_allowlist", "manila"), \
+         patch.object(settings, "forecast_log_all_cities", True), \
+         patch("src.station_obs.mapped_cities", return_value={"manila", "tokyo", "paris"}), \
+         patch("src.forecast.get_ensemble_forecast",
+               return_value=SimpleNamespace(mean_f=90.5)):
+        assert br.snapshot_daily_forecasts() == 3  # union, deduped

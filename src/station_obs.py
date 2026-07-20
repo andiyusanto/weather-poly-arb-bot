@@ -36,6 +36,12 @@ IEM_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 _station_map: Optional[dict] = None
 
 
+def mapped_cities() -> set:
+    """Lower-cased city keys that have a settlement-station mapping."""
+    station_for_city("")  # ensure map is loaded
+    return {k for k in (_station_map or {}) if not k.startswith("_")}
+
+
 def station_for_city(city: str) -> Optional[str]:
     """ICAO code of the settlement station for a city, or None if unmapped."""
     global _station_map

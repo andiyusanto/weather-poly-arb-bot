@@ -162,6 +162,11 @@ class Settings(BaseSettings):
     # automatically while station history is too thin.
     ground_truth_source: str = "om"
 
+    # Daily forecast logger scope: true = snapshot every station-mapped city
+    # (~52; feeds per-city skill ranking for evidence-based allowlist
+    # revisions + BMA). false = allowlist only (minimal API footprint).
+    forecast_log_all_cities: bool = True
+
     # ── Overround alert ──────────────────────────────────────────────────────
     # Alert (Telegram + WARNING log) when an event's YES asks sum to at least
     # this value: every bucket is overpriced, so buying NO across all of them

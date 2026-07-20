@@ -222,10 +222,21 @@ def record_bias_for_resolved_trade(trade: dict) -> bool:
 # Both are idempotent and best-effort; they piggyback on the resolve cycle.
 
 def snapshot_daily_forecasts() -> int:
-    """Log tomorrow's combined forecast mean for each allowlist city."""
-    from src.forecast import get_ensemble_forecast
+    """Log tomorrow's combined forecast mean — for EVERY station-mapped city.
 
-    cities = settings.city_allowlist_set
+    Not just the allowlist: per-city skill measured on clean day-ahead
+    forecasts vs settlement ground truth is the instrument future allowlist
+    revisions need (market-price city tables were shown to be noise,
+    2026-07-09). ~46 extra cities cost ~140 Open-Meteo calls once per day in
+    the resolve path. FORECAST_LOG_ALL_CITIES=false shrinks back to the
+    allowlist if quota ever becomes a concern.
+    """
+    from src.forecast import get_ensemble_forecast
+    from src.station_obs import mapped_cities
+
+    cities = set(settings.city_allowlist_set)
+    if settings.forecast_log_all_cities:
+        cities |= mapped_cities()
     if not cities:
         return 0
     target = (datetime.now(timezone.utc) + timedelta(days=1)).date()

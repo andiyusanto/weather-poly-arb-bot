@@ -34,6 +34,8 @@ _PINNED_DEFAULTS = {
     # Forecast engine: legacy KDE unless a test opts into EMOS explicitly
     "forecast_engine": "kde",
     "ground_truth_source": "om",
+    # Logger scope: tests pin allowlist-only for determinism
+    "forecast_log_all_cities": False,
 }
 
 
