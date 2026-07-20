@@ -579,6 +579,18 @@ def resolve_open_trades(verbose: bool = False) -> List[dict]:
         f"Resolved {len(newly_resolved)} trades this run "
         f"({still_pending} still pending finalization)."
     )
+
+    # Daily forecast logger: grow the bias/sigma ground-truth tables without
+    # trades (all funnel trades are same-day and excluded from bias recording).
+    # Idempotent per (city, target); snapshot uses the cached forecast the
+    # scanner already fetched, resolve fires once per elapsed target day.
+    try:
+        from src.bias_recorder import resolve_forecast_logs, snapshot_daily_forecasts
+        snapshot_daily_forecasts()
+        resolve_forecast_logs()
+    except Exception as e:  # noqa: BLE001 — instrumentation must never break resolution
+        logger.warning(f"forecast logger failed: {e}")
+
     return newly_resolved
 
 

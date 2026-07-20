@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import date as date_type, datetime
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Optional
 
 import httpx
@@ -209,3 +209,77 @@ def record_bias_for_resolved_trade(trade: dict) -> bool:
         + (f" (+{len(per_model)} per-model rows)" if per_model else "")
     )
     return True
+
+
+# ── Daily forecast logger ─────────────────────────────────────────────────────
+# The funnel's trades are nearly all same-day (intraday-clamped means, excluded
+# from bias recording by design), so trade-driven bias/sigma growth stalled at
+# the 2026-07-11 backfill. These two functions grow the ground-truth tables
+# every day regardless of trading: snapshot tomorrow's forecast mean per
+# allowlist city (first write wins → consistent ~24h lead, never clamped),
+# then score past snapshots against OM + settlement-station observations once
+# the target's local day has fully elapsed everywhere.
+# Both are idempotent and best-effort; they piggyback on the resolve cycle.
+
+def snapshot_daily_forecasts() -> int:
+    """Log tomorrow's combined forecast mean for each allowlist city."""
+    from src.forecast import get_ensemble_forecast
+
+    cities = settings.city_allowlist_set
+    if not cities:
+        return 0
+    target = (datetime.now(timezone.utc) + timedelta(days=1)).date()
+    n_new = 0
+    for key in sorted(cities):
+        geo = _geo.get(key)
+        if not geo:
+            continue
+        # Match the market classifier's naming (it .title()s the city) so
+        # logger rows and trade rows merge in per-city queries.
+        city = key.title()
+        try:
+            fc = get_ensemble_forecast(city, geo["lat"], geo["lon"], target)
+        except Exception as e:  # noqa: BLE001 — logging must never break resolve
+            logger.warning(f"forecast snapshot failed for {city}/{target}: {e}")
+            continue
+        if fc and getattr(fc, "mean_f", None):
+            if _bias_store.log_forecast(city, "temperature", target, float(fc.mean_f)):
+                n_new += 1
+    if n_new:
+        logger.info(f"forecast log: snapshotted {n_new} city means for {target}")
+    return n_new
+
+
+def resolve_forecast_logs() -> int:
+    """Score elapsed snapshots against OM + station; write bias rows."""
+    from src.station_obs import fetch_station_daily_max_f, station_for_city
+
+    # Local day D has ended everywhere once UTC reaches ~D+1 12:00 (UTC-12
+    # extreme). now-36h lands on D exactly then — the cheap universal guard.
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=36)).date()
+    pending = _bias_store.pending_forecast_logs(cutoff)
+    n_done = 0
+    for city, variable, target_str, mean_f in pending:
+        geo = _geo.get(city)
+        if not geo:
+            continue
+        target = datetime.strptime(target_str, "%Y-%m-%d").date()
+        observed = _fetch_observed(geo["lat"], geo["lon"], target, variable)
+        if observed is None:
+            continue
+        observed_f = celsius_to_fahrenheit(observed)
+        _bias_store.record(city=city, model="ensemble", variable=variable,
+                           target_date=target, forecast_mean=mean_f,
+                           observed=observed_f)
+        icao = station_for_city(city)
+        tz = geo.get("timezone") or ""
+        if icao and tz:
+            st_obs = fetch_station_daily_max_f(icao, target, tz)
+            if st_obs is not None:
+                _bias_store.record(city=city, model="station", variable=variable,
+                                   target_date=target, forecast_mean=mean_f,
+                                   observed=float(st_obs))
+        n_done += 1
+        logger.info(f"forecast log resolved {city}/{target}: "
+                    f"mean={mean_f:.2f} om={observed_f:.2f} err={observed_f - mean_f:+.2f}")
+    return n_done

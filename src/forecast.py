@@ -15,7 +15,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
@@ -336,6 +336,21 @@ class BiasStore:
                 c.execute("ALTER TABLE bias ADD COLUMN variable TEXT DEFAULT 'temperature'")
             except Exception:
                 pass
+            # Daily forecast snapshots — grow bias/sigma history without
+            # trades (the funnel's same-day trades are all excluded from bias
+            # recording, so trade-driven growth stalled; see 2026-07-20).
+            c.execute(
+                """
+                CREATE TABLE IF NOT EXISTS forecast_log (
+                    city TEXT,
+                    variable TEXT DEFAULT 'temperature',
+                    target_date TEXT,
+                    forecast_mean REAL,
+                    created_at TEXT,
+                    PRIMARY KEY (city, variable, target_date)
+                )
+                """
+            )
             c.commit()
 
     def record(self, city: str, model: str, variable: str, target_date: date,
@@ -346,6 +361,34 @@ class BiasStore:
                 (city, model, variable, str(target_date), forecast_mean, observed, observed - forecast_mean),
             )
             c.commit()
+
+    def log_forecast(self, city: str, variable: str, target_date: date,
+                     forecast_mean: float) -> bool:
+        """Snapshot a day-ahead forecast mean; first write per target wins
+        (keeps a consistent ~24h lead). Returns True if newly inserted."""
+        with sqlite3.connect(self._db) as c:
+            cur = c.execute(
+                "INSERT OR IGNORE INTO forecast_log VALUES (?,?,?,?,?)",
+                (city, variable, str(target_date), forecast_mean,
+                 datetime.now(timezone.utc).isoformat(timespec="seconds")),
+            )
+            c.commit()
+            return cur.rowcount > 0
+
+    def pending_forecast_logs(self, before: date) -> List[Tuple[str, str, str, float]]:
+        """Snapshots whose target day has fully elapsed and which have no
+        'ensemble' bias row yet (trade-recorded rows take precedence)."""
+        with sqlite3.connect(self._db) as c:
+            rows = c.execute(
+                """SELECT f.city, f.variable, f.target_date, f.forecast_mean
+                   FROM forecast_log f
+                   WHERE f.target_date <= ?
+                     AND NOT EXISTS (SELECT 1 FROM bias b WHERE b.city=f.city
+                          AND b.variable=f.variable AND b.target_date=f.target_date
+                          AND b.model='ensemble')""",
+                (str(before),),
+            ).fetchall()
+        return rows
 
     def get_correction(self, city: str, model: str, variable: str = "temperature",
                        days: int = 30) -> float:
