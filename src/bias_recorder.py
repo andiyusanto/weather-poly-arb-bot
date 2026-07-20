@@ -224,66 +224,92 @@ RESOLVE_MAX_AGE_DAYS = 14  # abandon snapshots older than this (OM past-date lim
 # the target's local day has fully elapsed everywhere.
 # Both are idempotent and best-effort; they piggyback on the resolve cycle.
 
-def snapshot_daily_forecasts() -> int:
-    """Log tomorrow's combined forecast mean — for EVERY station-mapped city.
-
-    Not just the allowlist: per-city skill measured on clean day-ahead
-    forecasts vs settlement ground truth is the instrument future allowlist
-    revisions need (market-price city tables were shown to be noise,
-    2026-07-09). ~46 extra cities cost ~140 Open-Meteo calls once per day in
-    the resolve path. FORECAST_LOG_ALL_CITIES=false shrinks back to the
-    allowlist if quota ever becomes a concern.
-    """
-    from src.forecast import get_ensemble_forecast
+def _snapshot_cities() -> set:
+    """Cities to snapshot: allowlist, plus every station-mapped city when
+    FORECAST_LOG_ALL_CITIES (per-city skill vs settlement is the instrument
+    future allowlist revisions need — market-price city tables are noise)."""
     from src.station_obs import mapped_cities
-
     cities = set(settings.city_allowlist_set)
     if settings.forecast_log_all_cities:
         cities |= mapped_cities()
-    if not cities:
-        return 0
-    target = (datetime.now(timezone.utc) + timedelta(days=1)).date()
-    # Skip already-snapshotted cities BEFORE fetching: only the first run
-    # after midnight UTC pays the ~52-city fetch; later 3h runs cost zero.
-    done = {c.lower() for c in _bias_store.logged_cities("temperature", target)}
-    n_new = 0
-    skipped_no_geo = []
+    return cities
+
+
+def _snapshot_one_lead(cities: set, target, lead: str) -> tuple[int, list]:
+    """Snapshot one (target, lead) bucket across cities. First-write-wins per
+    (city, target, lead); already-logged cities skipped BEFORE any fetch."""
+    from src.forecast import get_ensemble_forecast
+
+    now = datetime.now(timezone.utc)
+    # Rough hours-to-end-of-target-day, diagnostic only (the bucket is fixed).
+    lead_hours = ((datetime(target.year, target.month, target.day, tzinfo=timezone.utc)
+                   + timedelta(days=1)) - now).total_seconds() / 3600.0
+    done = {c.lower() for c in _bias_store.logged_cities("temperature", target, lead)}
+    n_new, skipped = 0, []
     for key in sorted(cities):
         if key.lower() in done:
             continue
         geo = _geo.get(key)
         if not geo:
-            skipped_no_geo.append(key)
+            skipped.append(key)
             continue
-        # Match the market classifier's naming (it .title()s the city) so
-        # logger rows and trade rows merge in per-city queries.
+        # Match the market classifier's naming (.title()) so logger rows and
+        # trade rows merge in per-city queries.
         city = key.title()
         try:
-            # allow_intraday=False: on a tz-ahead-of-UTC box, "UTC tomorrow"
-            # can equal box-local today, and the intraday clamp would
-            # permanently contaminate a first-write-wins snapshot.
+            # allow_intraday=False everywhere: the clamp compares against
+            # box-local today and would contaminate a first-write-wins
+            # snapshot; the same-day sigma must be pure forecast error, the
+            # intraday floor is handled separately at bucket_probability time.
             fc = get_ensemble_forecast(city, geo["lat"], geo["lon"], target,
                                        allow_intraday=False)
         except Exception as e:  # noqa: BLE001 — logging must never break resolve
-            logger.warning(f"forecast snapshot failed for {city}/{target}: {e}")
+            logger.warning(f"forecast snapshot failed for {city}/{target}/{lead}: {e}")
             continue
         mean_f = getattr(fc, "mean_f", None) if fc else None
         if mean_f is not None:  # explicit: 0.0°F is a real winter mean, not "missing"
-            if _bias_store.log_forecast(city, "temperature", target, float(mean_f)):
+            if _bias_store.log_forecast(city, "temperature", target, float(mean_f),
+                                        lead=lead, lead_hours=round(lead_hours, 1)):
                 n_new += 1
-    if n_new:
-        logger.info(f"forecast log: snapshotted {n_new} city means for {target}")
-    if skipped_no_geo:
+    return n_new, skipped
+
+
+def snapshot_daily_forecasts() -> int:
+    """Log the combined forecast mean at BOTH leads for every snapshot city.
+
+    day_ahead (target = UTC-tomorrow, ~24h lead) and same_day (target =
+    UTC-today, ~6–18h lead) give the two calibration points for a
+    lead-dependent EMOS sigma — the same_day one prices our same-day funnel
+    trades correctly instead of over-widening them with a day-ahead σ.
+    """
+    from src.forecast import LEAD_DAY_AHEAD, LEAD_SAME_DAY
+
+    cities = _snapshot_cities()
+    if not cities:
+        return 0
+    now = datetime.now(timezone.utc)
+    n_new = 0
+    skipped: set = set()
+    for target, lead in ((now.date() + timedelta(days=1), LEAD_DAY_AHEAD),
+                         (now.date(), LEAD_SAME_DAY)):
+        n, sk = _snapshot_one_lead(cities, target, lead)
+        n_new += n
+        skipped |= set(sk)
+        if n:
+            logger.info(f"forecast log: snapshotted {n} city means for {target} [{lead}]")
+    if skipped:
         # Mapped cities absent from the geocache never get snapshotted — the
-        # scanner only geocodes allowlist markets, so the "all-cities" skill
+        # scanner only geocodes allowlist markets, so the all-cities skill
         # sample is silently partial without this.
-        logger.warning(f"forecast log: {len(skipped_no_geo)} mapped cities not in "
-                       f"geocache, skipped: {sorted(skipped_no_geo)}")
+        logger.warning(f"forecast log: {len(skipped)} mapped cities not in "
+                       f"geocache, skipped: {sorted(skipped)}")
     return n_new
 
 
 def resolve_forecast_logs() -> int:
-    """Score elapsed snapshots against OM + station; write bias rows."""
+    """Score elapsed snapshots against OM + station; write lead-tagged bias
+    rows (day_ahead → ensemble/station, same_day → *@sameday)."""
+    from src.forecast import om_bias_model, station_bias_model
     from src.station_obs import fetch_station_daily_max_f, station_for_city
 
     # Local day D has ended everywhere once UTC reaches ~D+1 12:00 (UTC-12
@@ -295,7 +321,7 @@ def resolve_forecast_logs() -> int:
     oldest = (now - timedelta(days=RESOLVE_MAX_AGE_DAYS)).date()
     pending = _bias_store.pending_forecast_logs(cutoff, oldest)
     n_done = 0
-    for city, variable, target_str, mean_f, need_om, need_station in pending:
+    for city, variable, target_str, lead, mean_f, need_om, need_station in pending:
         geo = _geo.get(city)
         if not geo:
             continue
@@ -306,9 +332,9 @@ def resolve_forecast_logs() -> int:
             if observed is not None:
                 observed_f = (celsius_to_fahrenheit(observed)
                               if variable == "temperature" else float(observed))
-                _bias_store.record(city=city, model="ensemble", variable=variable,
-                                   target_date=target, forecast_mean=mean_f,
-                                   observed=observed_f)
+                _bias_store.record(city=city, model=om_bias_model(lead),
+                                   variable=variable, target_date=target,
+                                   forecast_mean=mean_f, observed=observed_f)
                 wrote = True
         if need_station and variable == "temperature":
             icao = station_for_city(city)
@@ -316,9 +342,9 @@ def resolve_forecast_logs() -> int:
             if icao and tz:
                 st_obs = fetch_station_daily_max_f(icao, target, tz)
                 if st_obs is not None:
-                    _bias_store.record(city=city, model="station", variable=variable,
-                                       target_date=target, forecast_mean=mean_f,
-                                       observed=float(st_obs))
+                    _bias_store.record(city=city, model=station_bias_model(lead),
+                                       variable=variable, target_date=target,
+                                       forecast_mean=mean_f, observed=float(st_obs))
                     wrote = True
         if wrote:
             n_done += 1

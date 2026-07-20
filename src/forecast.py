@@ -308,6 +308,42 @@ AnyForecast = Union[EnsembleForecast, PrecipForecast, SnowForecast, WindForecast
 
 # ── Bias correction store ─────────────────────────────────────────────────────
 
+# Lead buckets for lead-time-stratified sigma. day_ahead ≈ 24h (the classic
+# next-day forecast); same_day ≈ 6–18h (the lead our funnel actually trades
+# at). Forecast skill decays with lead, so a lead-specific sigma prices our
+# same-day trades correctly instead of over-widening them with a day-ahead σ.
+LEAD_DAY_AHEAD = "day_ahead"
+LEAD_SAME_DAY = "same_day"
+# Boundary (hours to end of target day) splitting the two buckets at snapshot.
+_SAME_DAY_LEAD_MAX_H = 20.0
+
+
+def om_bias_model(lead: str) -> str:
+    """bias.model tag for OM-ground-truth combined errors at a lead.
+    day_ahead keeps the legacy 'ensemble' tag (backward compatible)."""
+    return "ensemble" if lead == LEAD_DAY_AHEAD else "ensemble@sameday"
+
+
+def station_bias_model(lead: str) -> str:
+    """bias.model tag for settlement-station combined errors at a lead.
+    day_ahead keeps the legacy 'station' tag (backward compatible)."""
+    return "station" if lead == LEAD_DAY_AHEAD else "station@sameday"
+
+
+def _source_lead_fallbacks(source: str, lead: str) -> List[Tuple[str, str]]:
+    """Ordered (source, lead) attempts for sigma/std fitting. Prefer the exact
+    (source, lead); degrade same_day→day_ahead first (lead mismatch is milder
+    than ground-truth mismatch), then station→om, so a thin same_day-station
+    table still yields a usable sigma instead of dropping to the KDE floor."""
+    seen, out = set(), []
+    for src in ([source, "om"] if source == "station" else [source]):
+        for ld in ([lead, LEAD_DAY_AHEAD] if lead != LEAD_DAY_AHEAD else [lead]):
+            if (src, ld) not in seen:
+                seen.add((src, ld))
+                out.append((src, ld))
+    return out
+
+
 class BiasStore:
     """Per-city, per-model, per-variable bias correction."""
 
@@ -339,19 +375,44 @@ class BiasStore:
             # Daily forecast snapshots — grow bias/sigma history without
             # trades (the funnel's same-day trades are all excluded from bias
             # recording, so trade-driven growth stalled; see 2026-07-20).
-            c.execute(
-                """
-                CREATE TABLE IF NOT EXISTS forecast_log (
-                    city TEXT,
-                    variable TEXT DEFAULT 'temperature',
-                    target_date TEXT,
-                    forecast_mean REAL,
-                    created_at TEXT,
-                    PRIMARY KEY (city, variable, target_date)
-                )
-                """
-            )
+            # `lead` distinguishes day_ahead (~24h) from same_day (~6-18h)
+            # snapshots of the same target — forecast skill decays with lead,
+            # and our funnel trades same-day, so a lead-specific sigma prices
+            # our actual trades correctly (see 2026-07-20).
+            self._migrate_forecast_log(c)
             c.commit()
+
+    @staticmethod
+    def _migrate_forecast_log(c: sqlite3.Connection) -> None:
+        """Create forecast_log with a lead-aware PK, rebuilding a pre-lead
+        table in place (its PK can't be ALTERed, and without lead in the PK a
+        same_day row would collide with the target's day_ahead row)."""
+        cols = {r[1]: r for r in c.execute("PRAGMA table_info(forecast_log)")}
+        lead_in_pk = cols.get("lead") and cols["lead"][5]  # pk index > 0
+        if cols and not lead_in_pk:
+            c.execute("ALTER TABLE forecast_log RENAME TO forecast_log_old")
+        c.execute(
+            """
+            CREATE TABLE IF NOT EXISTS forecast_log (
+                city TEXT,
+                variable TEXT DEFAULT 'temperature',
+                target_date TEXT,
+                lead TEXT DEFAULT 'day_ahead',
+                forecast_mean REAL,
+                lead_hours REAL,
+                created_at TEXT,
+                PRIMARY KEY (city, variable, target_date, lead)
+            )
+            """
+        )
+        if cols and not lead_in_pk:
+            c.execute(
+                """INSERT OR IGNORE INTO forecast_log
+                   (city, variable, target_date, lead, forecast_mean, created_at)
+                   SELECT city, variable, target_date, 'day_ahead', forecast_mean,
+                          created_at FROM forecast_log_old"""
+            )
+            c.execute("DROP TABLE forecast_log_old")
 
     def record(self, city: str, model: str, variable: str, target_date: date,
                forecast_mean: float, observed: float) -> None:
@@ -363,55 +424,62 @@ class BiasStore:
             c.commit()
 
     def log_forecast(self, city: str, variable: str, target_date: date,
-                     forecast_mean: float) -> bool:
-        """Snapshot a day-ahead forecast mean; first write per target wins
-        (keeps a consistent ~24h lead). Returns True if newly inserted."""
+                     forecast_mean: float, lead: str = "day_ahead",
+                     lead_hours: Optional[float] = None) -> bool:
+        """Snapshot a forecast mean at a given lead; first write per
+        (city, variable, target, lead) wins (keeps a consistent lead per
+        bucket). Returns True if newly inserted."""
         with sqlite3.connect(self._db) as c:
             cur = c.execute(
-                "INSERT OR IGNORE INTO forecast_log VALUES (?,?,?,?,?)",
-                (city, variable, str(target_date), forecast_mean,
+                """INSERT OR IGNORE INTO forecast_log
+                   (city, variable, target_date, lead, forecast_mean, lead_hours, created_at)
+                   VALUES (?,?,?,?,?,?,?)""",
+                (city, variable, str(target_date), lead, forecast_mean, lead_hours,
                  datetime.now(timezone.utc).isoformat(timespec="seconds")),
             )
             c.commit()
             return cur.rowcount > 0
 
-    def logged_cities(self, variable: str, target_date: date) -> set:
-        """Cities already snapshotted for a target — callers skip these BEFORE
-        fetching forecasts (a post-fetch dedup would re-fetch ~52 cities every
-        resolve run: ~1,250 wasted Open-Meteo calls/day at 3h cadence)."""
+    def logged_cities(self, variable: str, target_date: date,
+                      lead: str = "day_ahead") -> set:
+        """Cities already snapshotted for a (target, lead) — callers skip these
+        BEFORE fetching forecasts (a post-fetch dedup would re-fetch ~52 cities
+        every resolve run: ~1,250 wasted Open-Meteo calls/day at 3h cadence)."""
         with sqlite3.connect(self._db) as c:
             rows = c.execute(
-                "SELECT city FROM forecast_log WHERE variable=? AND target_date=?",
-                (variable, str(target_date)),
+                "SELECT city FROM forecast_log WHERE variable=? AND target_date=? AND lead=?",
+                (variable, str(target_date), lead),
             ).fetchall()
         return {r[0] for r in rows}
 
     def pending_forecast_logs(self, before: date, oldest: date
-                              ) -> List[Tuple[str, str, str, float, bool, bool]]:
+                              ) -> List[Tuple[str, str, str, str, float, bool, bool]]:
         """Elapsed snapshots still missing an OM or station bias row.
 
-        Returns (city, variable, target_date, forecast_mean, need_om,
-        need_station) for targets in [oldest, before]. The two legs are
-        tracked independently so a transient IEM failure that lost only the
-        station row is retried on later runs (the OM leg won't be rewritten).
-        ``oldest`` caps the retry window — past it, OM's past-date endpoint no
-        longer serves the day and the row is abandoned rather than re-fetched
-        forever (bounds the per-run work and the shared Open-Meteo quota)."""
+        Returns (city, variable, target_date, lead, forecast_mean, need_om,
+        need_station) for targets in [oldest, before]. Each lead scores into
+        its own bias tags (om_bias_model / station_bias_model), so day_ahead
+        and same_day errors for one target never collide. The two ground-truth
+        legs are tracked independently so a transient IEM failure that lost
+        only the station row is retried later (the OM leg won't be rewritten).
+        ``oldest`` caps the retry window — past it OM's past-date endpoint no
+        longer serves the day and the row is abandoned."""
         with sqlite3.connect(self._db) as c:
             rows = c.execute(
-                """SELECT f.city, f.variable, f.target_date, f.forecast_mean,
-                     NOT EXISTS (SELECT 1 FROM bias b WHERE b.city=f.city
-                          AND b.variable=f.variable AND b.target_date=f.target_date
-                          AND b.model='ensemble'),
-                     NOT EXISTS (SELECT 1 FROM bias b WHERE b.city=f.city
-                          AND b.variable=f.variable AND b.target_date=f.target_date
-                          AND b.model='station')
+                """SELECT f.city, f.variable, f.target_date, f.lead, f.forecast_mean
                    FROM forecast_log f
                    WHERE f.target_date <= ? AND f.target_date >= ?""",
                 (str(before), str(oldest)),
             ).fetchall()
-        # Keep only rows that still need at least one leg written.
-        return [r for r in rows if r[4] or r[5]]
+            existing = {(r[0], r[1], r[2], r[3]) for r in c.execute(
+                "SELECT city, variable, target_date, model FROM bias")}
+        out = []
+        for city, variable, td, lead, fm in rows:
+            need_om = (city, variable, td, om_bias_model(lead)) not in existing
+            need_station = (city, variable, td, station_bias_model(lead)) not in existing
+            if need_om or need_station:
+                out.append((city, variable, td, lead, fm, need_om, need_station))
+        return out
 
     def get_correction(self, city: str, model: str, variable: str = "temperature",
                        days: int = 30) -> float:
@@ -429,103 +497,85 @@ class BiasStore:
         return float(np.mean([r[0] for r in rows])) if rows else 0.0
 
     def _combined_errors(self, variable: str, city: Optional[str] = None,
-                         source: str = "om") -> List[float]:
+                         source: str = "om", lead: str = "day_ahead") -> List[float]:
         """
         Errors of the COMBINED ensemble mean, one value per (city, date).
 
-        ``source`` picks the ground truth:
-          "om"      — Open-Meteo grid observations: rows tagged
-                      model='ensemble' merged with legacy rows (which
-                      duplicated the combined mean under every model name;
-                      averaging per (city, date) reproduces the combined
-                      error exactly). model='station' rows are EXCLUDED.
-          "station" — settlement-station METAR observations (model='station'
-                      rows, recorded in parallel since 2026-07-11). The
-                      2026-07-11 audit showed OM lands in the winning bucket
-                      only 26% of the time — station rows measure error
-                      against the quantity that actually pays.
-
-        Merging is per (city, date) with ensemble rows winning over legacy:
-        an all-or-nothing preference would let the FIRST post-fix ensemble
-        row hide months of legacy history (error_std → None, EMOS stuck on
-        the KDE fallback until new rows accumulate).
+        ``source`` picks the ground truth, ``lead`` the forecast horizon:
+          source "om"/"station" × lead "day_ahead"/"same_day" → the bias
+          model tag written by the forecast logger (om_bias_model /
+          station_bias_model). day_ahead OM also merges pre-2026-07-10 legacy
+          rows (which duplicated the combined mean under every model name;
+          AVG reproduces it), so months of history aren't hidden by the first
+          logger row. The legacy branch is capped at the 2026-07-10 recorder
+          fix — after it, per-model rows carry each model's OWN day-of mean
+          and same-day trades write no ensemble row, so an uncapped AVG would
+          leak day-of errors and re-open the sigma self-sharpening loop.
         """
         where_city = " AND city=?" if city else ""
         args: tuple = (variable, city) if city else (variable,)
+        model = om_bias_model(lead) if source == "om" else station_bias_model(lead)
         with sqlite3.connect(self._db) as c:
-            if source == "station":
-                rows = c.execute(
-                    f"SELECT city, target_date, error FROM bias "
-                    f"WHERE variable=? AND model='station'{where_city}",
+            rows = c.execute(
+                f"SELECT city, target_date, error FROM bias "
+                f"WHERE variable=? AND model=?{where_city}",
+                (args[0], model, *args[1:]),
+            ).fetchall()
+            merged = {(r[0], r[1]): r[2] for r in rows if r[2] is not None}
+            # day_ahead OM additionally absorbs pre-fix legacy per-model rows.
+            if source == "om" and lead == "day_ahead":
+                legacy = c.execute(
+                    f"""SELECT city, target_date, AVG(error) FROM bias
+                        WHERE variable=? AND model NOT IN
+                          ('ensemble','station','ensemble@sameday','station@sameday')
+                          AND target_date < '2026-07-10'{where_city}
+                        GROUP BY city, target_date""",
                     args,
                 ).fetchall()
-                return [r[2] for r in rows if r[2] is not None]
-            # Legacy branch is CAPPED at the 2026-07-10 recorder fix: before it,
-            # per-model rows duplicated the combined mean (AVG reproduces it
-            # exactly); after it, per-model rows carry each model's OWN day-of
-            # mean and same-day trades deliberately write NO ensemble row —
-            # without the cap their AVG leaks day-of-lead samples into the
-            # combined-error pool, re-opening the sigma self-sharpening loop
-            # the same-day exclusion exists to prevent (review 2026-07-20).
-            legacy = c.execute(
-                f"""SELECT city, target_date, AVG(error) FROM bias
-                    WHERE variable=? AND model NOT IN ('ensemble','station')
-                      AND target_date < '2026-07-10'{where_city}
-                    GROUP BY city, target_date""",
-                args,
-            ).fetchall()
-            ens = c.execute(
-                f"SELECT city, target_date, error FROM bias "
-                f"WHERE variable=? AND model='ensemble'{where_city}",
-                args,
-            ).fetchall()
-        merged = {(r[0], r[1]): r[2] for r in legacy}
-        merged.update({(r[0], r[1]): r[2] for r in ens})
+                for r in legacy:
+                    merged.setdefault((r[0], r[1]), r[2])  # ensemble row wins
         return [v for v in merged.values() if v is not None]
 
     def error_std(self, variable: str = "temperature",
                   min_samples: int = MIN_DISPERSION_SAMPLES,
-                  source: str = "om") -> Optional[float]:
+                  source: str = "om", lead: str = "day_ahead") -> Optional[float]:
         """
         Global std of realized combined-mean forecast errors — the floor the
         forecast spread should not undercut. Returns None if too few samples.
-        source='station' falls back to 'om' while station history is thin.
+        Falls back station→om and same_day→day_ahead while history is thin.
         """
-        errs = self._combined_errors(variable, source=source)
-        if len(errs) < min_samples and source == "station":
-            errs = self._combined_errors(variable, source="om")
-        if len(errs) < min_samples:
-            return None
-        return float(np.std(errs))
+        for src, ld in _source_lead_fallbacks(source, lead):
+            errs = self._combined_errors(variable, source=src, lead=ld)
+            if len(errs) >= min_samples:
+                return float(np.std(errs))
+        return None
 
     def city_error_sigma(self, city: str, variable: str = "temperature",
                          shrink_k: int = 10,
                          min_global: int = MIN_DISPERSION_SAMPLES,
-                         source: str = "om") -> Optional[float]:
+                         source: str = "om", lead: str = "day_ahead") -> Optional[float]:
         """
         Per-city predictive sigma for the EMOS engine, shrunk toward the
         global error std by w = n/(n+k). Per-city stds ranged 1.0–3.8°F on
-        2026-07-10, so a single global sigma is wrong in both directions:
-        underconfident in tight cities, overconfident in volatile ones.
+        2026-07-10, so a single global sigma is wrong in both directions.
 
-        source='station' measures against settlement-station ground truth and
-        silently falls back to 'om' while the station history is too thin.
-        Returns None when even the OM history is too thin — callers must
-        fall back to the KDE/dispersion-floor path.
+        (source, lead) select the ground truth and horizon; the fallback
+        ladder (station→om, same_day→day_ahead) keeps a usable sigma while the
+        newer tables are thin. Returns None when even day_ahead OM is too thin
+        — callers then use the KDE/dispersion-floor path.
         """
-        all_errs = self._combined_errors(variable, source=source)
-        if len(all_errs) < min_global and source == "station":
-            source = "om"
-            all_errs = self._combined_errors(variable, source=source)
-        if len(all_errs) < min_global:
-            return None
-        g_var = float(np.var(all_errs))
-        city_errs = self._combined_errors(variable, city=city, source=source)
-        n = len(city_errs)
-        if n < 2:
-            return float(np.sqrt(g_var))
-        w = n / (n + shrink_k)
-        return float(np.sqrt(w * float(np.var(city_errs)) + (1 - w) * g_var))
+        for src, ld in _source_lead_fallbacks(source, lead):
+            all_errs = self._combined_errors(variable, source=src, lead=ld)
+            if len(all_errs) < min_global:
+                continue
+            g_var = float(np.var(all_errs))
+            city_errs = self._combined_errors(variable, city=city, source=src, lead=ld)
+            n = len(city_errs)
+            if n < 2:
+                return float(np.sqrt(g_var))
+            w = n / (n + shrink_k)
+            return float(np.sqrt(w * float(np.var(city_errs)) + (1 - w) * g_var))
+        return None
 
 
 _bias_store = BiasStore()
@@ -796,11 +846,17 @@ def get_ensemble_forecast(
     result.std_f = float(np.std(all_weighted))
     result.confidence = _temp_confidence(result.std_f, len(result.model_results))
 
-    # EMOS engine: swap the second moment for the city's realized error sigma.
+    # EMOS engine: swap the second moment for the city's realized error sigma,
+    # at the lead we're actually forecasting (same_day forecasts are sharper
+    # than day-ahead; a day-ahead σ would over-widen our same-day trades and
+    # understate their EV). UTC basis matches the forecast logger's snapshots.
     # Falls back to KDE silently when the bias history is too thin to fit.
     engine = "kde"
     if settings.forecast_engine == "emos":
-        sigma = _bias_store.city_error_sigma(city, source=settings.ground_truth_source)
+        lead = (LEAD_SAME_DAY if target_date == datetime.now(timezone.utc).date()
+                else LEAD_DAY_AHEAD)
+        sigma = _bias_store.city_error_sigma(city, source=settings.ground_truth_source,
+                                             lead=lead)
         if sigma is not None:
             result.emos_sigma_f = max(sigma, 0.8)  # never sharper than 0.8°F
             engine = "emos"

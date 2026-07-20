@@ -23,15 +23,15 @@ def _geo_stub(key):
     return {"lat": 14.6, "lon": 121.0, "timezone": "Asia/Manila", "display_name": key.title()}
 
 
-def test_snapshot_first_write_wins(tmp_path: Path) -> None:
+def test_snapshot_first_write_wins_both_leads(tmp_path: Path) -> None:
     store = BiasStore(tmp_path / "b.db")
     with patch.object(br, "_bias_store", store), \
          patch.object(br._geo, "get", side_effect=_geo_stub), \
          patch.object(settings, "city_allowlist", "manila"), \
          patch("src.forecast.get_ensemble_forecast",
                return_value=SimpleNamespace(mean_f=90.5)):
-        assert br.snapshot_daily_forecasts() == 1
-    # second snapshot with a different mean must NOT overwrite
+        assert br.snapshot_daily_forecasts() == 2  # day_ahead + same_day
+    # second snapshot with a different mean must NOT overwrite either lead
     with patch.object(br, "_bias_store", store), \
          patch.object(br._geo, "get", side_effect=_geo_stub), \
          patch.object(settings, "city_allowlist", "manila"), \
@@ -39,8 +39,9 @@ def test_snapshot_first_write_wins(tmp_path: Path) -> None:
                return_value=SimpleNamespace(mean_f=95.0)):
         assert br.snapshot_daily_forecasts() == 0
     with sqlite3.connect(store._db) as c:
-        rows = c.execute("SELECT city, forecast_mean FROM forecast_log").fetchall()
-    assert rows == [("Manila", 90.5)]
+        leads = {lead: fm for lead, fm in c.execute(
+            "SELECT lead, forecast_mean FROM forecast_log ORDER BY lead")}
+    assert leads == {"day_ahead": 90.5, "same_day": 90.5}  # both kept, neither overwritten
 
 
 def _log_past_snapshot(store: BiasStore, days_ago: int = 3, mean: float = 90.0) -> str:
@@ -149,7 +150,7 @@ def test_snapshot_all_cities_includes_station_mapped(tmp_path: Path) -> None:
          patch("src.station_obs.mapped_cities", return_value={"manila", "tokyo", "paris"}), \
          patch("src.forecast.get_ensemble_forecast",
                return_value=SimpleNamespace(mean_f=90.5)):
-        assert br.snapshot_daily_forecasts() == 3  # union, deduped
+        assert br.snapshot_daily_forecasts() == 6  # (union of 3) × 2 leads
 
 
 def test_snapshot_records_zero_fahrenheit_mean(tmp_path: Path) -> None:
@@ -161,7 +162,7 @@ def test_snapshot_records_zero_fahrenheit_mean(tmp_path: Path) -> None:
          patch.object(settings, "forecast_log_all_cities", False), \
          patch("src.forecast.get_ensemble_forecast",
                return_value=SimpleNamespace(mean_f=0.0)):
-        assert br.snapshot_daily_forecasts() == 1
+        assert br.snapshot_daily_forecasts() == 2  # both leads
     with sqlite3.connect(store._db) as c:
         assert c.execute("SELECT forecast_mean FROM forecast_log").fetchone()[0] == 0.0
 
@@ -178,3 +179,59 @@ def test_snapshot_passes_allow_intraday_false(tmp_path: Path) -> None:
                return_value=SimpleNamespace(mean_f=90.0)) as gef:
         br.snapshot_daily_forecasts()
         assert gef.call_args.kwargs.get("allow_intraday") is False
+
+
+def test_lead_stratified_sigma_is_independent(tmp_path: Path) -> None:
+    # day_ahead and same_day errors live under separate bias tags and yield
+    # separate sigmas — the whole point of lead stratification.
+    from src.forecast import (LEAD_DAY_AHEAD, LEAD_SAME_DAY,
+                              om_bias_model, station_bias_model)
+    store = BiasStore(tmp_path / "b.db")
+    for i in range(30):
+        d = date(2026, 6, 1) + timedelta(days=i)
+        # wide day-ahead errors, tight same-day errors (skill improves w/ lead)
+        store.record(city="Manila", model=om_bias_model(LEAD_DAY_AHEAD),
+                     variable="temperature", target_date=d,
+                     forecast_mean=90.0, observed=90.0 + (3.0 if i % 2 else -3.0))
+        store.record(city="Manila", model=om_bias_model(LEAD_SAME_DAY),
+                     variable="temperature", target_date=d,
+                     forecast_mean=90.0, observed=90.0 + (0.8 if i % 2 else -0.8))
+    sig_da = store.city_error_sigma("Manila", min_global=20, lead=LEAD_DAY_AHEAD)
+    sig_sd = store.city_error_sigma("Manila", min_global=20, lead=LEAD_SAME_DAY)
+    assert sig_da > 2.5 and sig_sd < 1.2   # distinct, same_day much tighter
+    # day_ahead tag must not see same_day rows and vice versa
+    assert om_bias_model(LEAD_DAY_AHEAD) == "ensemble"
+    assert om_bias_model(LEAD_SAME_DAY) == "ensemble@sameday"
+    assert station_bias_model(LEAD_SAME_DAY) == "station@sameday"
+
+
+def test_same_day_sigma_falls_back_to_day_ahead_when_thin(tmp_path: Path) -> None:
+    from src.forecast import LEAD_DAY_AHEAD, LEAD_SAME_DAY, om_bias_model
+    store = BiasStore(tmp_path / "b.db")
+    for i in range(30):  # only day_ahead history exists
+        store.record(city="Manila", model=om_bias_model(LEAD_DAY_AHEAD),
+                     variable="temperature", target_date=date(2026, 6, 1) + timedelta(days=i),
+                     forecast_mean=90.0, observed=90.0 + (2.0 if i % 2 else -2.0))
+    # same_day requested but empty → falls back to day_ahead sigma, not None
+    sig = store.city_error_sigma("Manila", min_global=20, lead=LEAD_SAME_DAY)
+    assert sig is not None and 1.5 < sig < 2.5
+
+
+def test_legacy_forecast_log_migrates_to_lead_pk(tmp_path: Path) -> None:
+    # A pre-lead forecast_log (old PK) must rebuild so same_day rows don't
+    # collide with day_ahead on the old (city,variable,target) PK.
+    import sqlite3
+    db = tmp_path / "b.db"
+    with sqlite3.connect(db) as c:
+        c.execute("""CREATE TABLE forecast_log (city TEXT, variable TEXT,
+                     target_date TEXT, forecast_mean REAL, created_at TEXT,
+                     PRIMARY KEY (city, variable, target_date))""")
+        c.execute("INSERT INTO forecast_log VALUES ('Manila','temperature','2026-07-19',90.0,'x')")
+    store = BiasStore(db)  # triggers migration
+    # old row preserved as day_ahead, and a same_day row now coexists
+    assert store.log_forecast("Manila", "temperature", date(2026, 7, 19), 88.0,
+                              lead="same_day") is True
+    with sqlite3.connect(db) as c:
+        leads = sorted(r[0] for r in c.execute(
+            "SELECT lead FROM forecast_log WHERE target_date='2026-07-19'"))
+    assert leads == ["day_ahead", "same_day"]
