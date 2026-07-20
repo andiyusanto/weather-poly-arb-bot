@@ -439,6 +439,24 @@ def shadow_pnl() -> None:
     shadow_performance_report()
 
 
+@app.command(name="capture-intraday")
+def capture_intraday() -> None:
+    """
+    Observation-only: snapshot books + station state for today's allowlist
+    temperature markets (the #3 peak-passed edge — see docs/edge_candidates).
+
+    Places NO orders and is NOT part of the scan→trade cycle. Writes to a
+    separate db (intraday_book.db). Run from its own cron every ~30 min; needs
+    INTRADAY_CAPTURE=true to do anything.
+    """
+    setup_logging()
+    from src.intraday_capture import capture_intraday_books
+    n = capture_intraday_books()
+    console.print(f"[green]intraday capture: {n} bucket rows written[/green]"
+                  if n else "[yellow]intraday capture: nothing written "
+                  "(flag off, no markets in window, or all legs failed)[/yellow]")
+
+
 @app.command()
 def side_pnl(
     side: str = typer.Option("both", "--side", help="'yes', 'no', or 'both' (default)."),

@@ -22,6 +22,9 @@ LOGS_DIR.mkdir(exist_ok=True)
 CITIES_CACHE_DB = DATA_DIR / "cities_cache.db"
 BIAS_DB = DATA_DIR / "bias_corrections.db"
 TRADES_DB = DATA_DIR / "trades.db"
+# Observation-only intraday book capture (research; see Settings.intraday_capture).
+# Deliberately a separate file from trades.db so it can never perturb the funnel.
+INTRADAY_DB = DATA_DIR / "intraday_book.db"
 CITIES_YAML = CONFIG_DIR / "cities.yaml"
 
 VALID_MARKET_TYPES = {"temperature", "precipitation", "snowfall", "wind_speed"}
@@ -166,6 +169,20 @@ class Settings(BaseSettings):
     # (~52; feeds per-city skill ranking for evidence-based allowlist
     # revisions + BMA). false = allowlist only (minimal API footprint).
     forecast_log_all_cities: bool = True
+
+    # ── Intraday book capture (research only — the #3 "peak-passed" market half) ─
+    # Observation-only logger for the same-day intraday edge: once the local
+    # afternoon peak has passed, the daily max is meteorologically locked
+    # (2026-07-20 ceiling backtest: median ~8h, ~6h real-time, deterministic
+    # window per city-day), yet thin markets keep pricing uncertainty. This
+    # snapshots the book + running station max for allowlist temperature markets
+    # resolving today, into a SEPARATE db (intraday_book.db). It NEVER places an
+    # order and is NOT part of the scan→trade cycle — run it from its own cron
+    # (`python run.py capture-intraday`), not the trading process. Default off;
+    # turning it on cannot touch the frozen verdict funnel.
+    intraday_capture: bool = False
+    # Only capture markets resolving within this many hours (i.e. "today").
+    intraday_capture_max_hours: float = 18.0
 
     # ── Overround alert ──────────────────────────────────────────────────────
     # Alert (Telegram + WARNING log) when an event's YES asks sum to at least
