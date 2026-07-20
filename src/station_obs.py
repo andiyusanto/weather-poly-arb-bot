@@ -36,22 +36,35 @@ IEM_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
 _station_map: Optional[dict] = None
 
 
+def _load_station_map() -> dict:
+    """Return the station map, (re)loading on demand.
+
+    A failed/empty load is NOT cached: the map is the prerequisite for the
+    GROUND_TRUTH_SOURCE=station flip, so a transient read error (e.g. reading
+    the file mid-rewrite) must not permanently disable station recording for
+    a long-running process. Retries on every call until a non-empty map loads.
+    """
+    global _station_map
+    if _station_map:
+        return _station_map
+    try:
+        data = json.loads(STATION_MAP_PATH.read_text())
+    except (OSError, ValueError) as e:
+        logger.error(f"station map unavailable ({e}) — station ground truth "
+                     f"disabled until it loads; will retry")
+        return {}
+    _station_map = data
+    return _station_map
+
+
 def mapped_cities() -> set:
     """Lower-cased city keys that have a settlement-station mapping."""
-    station_for_city("")  # ensure map is loaded
-    return {k for k in (_station_map or {}) if not k.startswith("_")}
+    return {k for k in _load_station_map() if not k.startswith("_")}
 
 
 def station_for_city(city: str) -> Optional[str]:
     """ICAO code of the settlement station for a city, or None if unmapped."""
-    global _station_map
-    if _station_map is None:
-        try:
-            _station_map = json.loads(STATION_MAP_PATH.read_text())
-        except (OSError, ValueError) as e:
-            logger.warning(f"station map unavailable ({e}) — station ground truth disabled")
-            _station_map = {}
-    entry = _station_map.get(city.strip().lower())
+    entry = _load_station_map().get(city.strip().lower())
     return entry.get("icao") if isinstance(entry, dict) else None
 
 

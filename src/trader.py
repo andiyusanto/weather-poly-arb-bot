@@ -478,6 +478,18 @@ def resolve_open_trades(verbose: bool = False) -> List[dict]:
     Returns:
         List of newly resolved trade dicts (with outcome and pnl filled in).
     """
+    # Daily forecast logger FIRST — before the no-open-trades early return.
+    # Quiet days (nothing to resolve) are exactly when the logger is the only
+    # source of bias/sigma growth; hooked after the return it silently skipped
+    # them (found in review, 2026-07-20). Idempotent: later runs skip
+    # already-snapshotted cities before any network fetch.
+    try:
+        from src.bias_recorder import resolve_forecast_logs, snapshot_daily_forecasts
+        snapshot_daily_forecasts()
+        resolve_forecast_logs()
+    except Exception as e:  # noqa: BLE001 — instrumentation must never break resolution
+        logger.warning(f"forecast logger failed: {e}")
+
     open_trades = _trade_store.open_unresolved_trades()
     if not open_trades:
         logger.info("No open trades to resolve (shadow + live).")
@@ -579,18 +591,6 @@ def resolve_open_trades(verbose: bool = False) -> List[dict]:
         f"Resolved {len(newly_resolved)} trades this run "
         f"({still_pending} still pending finalization)."
     )
-
-    # Daily forecast logger: grow the bias/sigma ground-truth tables without
-    # trades (all funnel trades are same-day and excluded from bias recording).
-    # Idempotent per (city, target); snapshot uses the cached forecast the
-    # scanner already fetched, resolve fires once per elapsed target day.
-    try:
-        from src.bias_recorder import resolve_forecast_logs, snapshot_daily_forecasts
-        snapshot_daily_forecasts()
-        resolve_forecast_logs()
-    except Exception as e:  # noqa: BLE001 — instrumentation must never break resolution
-        logger.warning(f"forecast logger failed: {e}")
-
     return newly_resolved
 
 

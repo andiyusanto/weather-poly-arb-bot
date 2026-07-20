@@ -87,17 +87,16 @@ def main() -> None:
             geo[k] = tz
 
     conn = sqlite3.connect(BIAS_DB)
-    # Combined mean per (city, date): prefer ensemble rows, else legacy AVG.
+    # Combined mean per (city, date). Only pairs that HAVE an ensemble row (a
+    # true combined day-ahead mean): pre-2026-07-10 legacy rows duplicated it,
+    # forecast-logger and non-same-day trades write it. Pairs with ONLY
+    # per-model rows are same-day trades — the recorder deliberately writes no
+    # combined row for them; fabricating one from an unweighted AVG of
+    # per-model means would inject short-lead errors into station sigma, the
+    # very self-sharpening the same-day exclusion prevents (review 2026-07-20).
     targets = conn.execute("""
-        SELECT city, target_date,
-               COALESCE(
-                 (SELECT e.forecast_mean FROM bias e WHERE e.city=b.city
-                    AND e.target_date=b.target_date AND e.model='ensemble'
-                    AND e.variable='temperature'),
-                 AVG(forecast_mean)) AS fm
-        FROM bias b
-        WHERE b.variable='temperature' AND b.model NOT IN ('station')
-        GROUP BY city, target_date
+        SELECT city, target_date, forecast_mean FROM bias
+        WHERE variable='temperature' AND model='ensemble'
     """).fetchall()
     have = {(r[0], r[1]) for r in conn.execute(
         "SELECT city, target_date FROM bias WHERE model='station'")}

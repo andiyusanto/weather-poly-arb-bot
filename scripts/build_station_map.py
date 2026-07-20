@@ -104,7 +104,11 @@ def main() -> None:
     existing.update(stations)
     existing["_meta"] = {"updated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                         "source": "Wunderground URL in Gamma market descriptions"}
-    OUT.write_text(json.dumps(existing, indent=1, sort_keys=True))
+    # Atomic write: a reader (the live bot's station_for_city) must never see a
+    # truncated file mid-rewrite.
+    tmp = OUT.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(existing, indent=1, sort_keys=True))
+    tmp.replace(OUT)
     n = len([k for k in existing if not k.startswith("_")])
     print(f"\nstation map: {n} cities -> {OUT}")
 

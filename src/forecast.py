@@ -375,20 +375,43 @@ class BiasStore:
             c.commit()
             return cur.rowcount > 0
 
-    def pending_forecast_logs(self, before: date) -> List[Tuple[str, str, str, float]]:
-        """Snapshots whose target day has fully elapsed and which have no
-        'ensemble' bias row yet (trade-recorded rows take precedence)."""
+    def logged_cities(self, variable: str, target_date: date) -> set:
+        """Cities already snapshotted for a target — callers skip these BEFORE
+        fetching forecasts (a post-fetch dedup would re-fetch ~52 cities every
+        resolve run: ~1,250 wasted Open-Meteo calls/day at 3h cadence)."""
         with sqlite3.connect(self._db) as c:
             rows = c.execute(
-                """SELECT f.city, f.variable, f.target_date, f.forecast_mean
-                   FROM forecast_log f
-                   WHERE f.target_date <= ?
-                     AND NOT EXISTS (SELECT 1 FROM bias b WHERE b.city=f.city
-                          AND b.variable=f.variable AND b.target_date=f.target_date
-                          AND b.model='ensemble')""",
-                (str(before),),
+                "SELECT city FROM forecast_log WHERE variable=? AND target_date=?",
+                (variable, str(target_date)),
             ).fetchall()
-        return rows
+        return {r[0] for r in rows}
+
+    def pending_forecast_logs(self, before: date, oldest: date
+                              ) -> List[Tuple[str, str, str, float, bool, bool]]:
+        """Elapsed snapshots still missing an OM or station bias row.
+
+        Returns (city, variable, target_date, forecast_mean, need_om,
+        need_station) for targets in [oldest, before]. The two legs are
+        tracked independently so a transient IEM failure that lost only the
+        station row is retried on later runs (the OM leg won't be rewritten).
+        ``oldest`` caps the retry window — past it, OM's past-date endpoint no
+        longer serves the day and the row is abandoned rather than re-fetched
+        forever (bounds the per-run work and the shared Open-Meteo quota)."""
+        with sqlite3.connect(self._db) as c:
+            rows = c.execute(
+                """SELECT f.city, f.variable, f.target_date, f.forecast_mean,
+                     NOT EXISTS (SELECT 1 FROM bias b WHERE b.city=f.city
+                          AND b.variable=f.variable AND b.target_date=f.target_date
+                          AND b.model='ensemble'),
+                     NOT EXISTS (SELECT 1 FROM bias b WHERE b.city=f.city
+                          AND b.variable=f.variable AND b.target_date=f.target_date
+                          AND b.model='station')
+                   FROM forecast_log f
+                   WHERE f.target_date <= ? AND f.target_date >= ?""",
+                (str(before), str(oldest)),
+            ).fetchall()
+        # Keep only rows that still need at least one leg written.
+        return [r for r in rows if r[4] or r[5]]
 
     def get_correction(self, city: str, model: str, variable: str = "temperature",
                        days: int = 30) -> float:
@@ -437,9 +460,17 @@ class BiasStore:
                     args,
                 ).fetchall()
                 return [r[2] for r in rows if r[2] is not None]
+            # Legacy branch is CAPPED at the 2026-07-10 recorder fix: before it,
+            # per-model rows duplicated the combined mean (AVG reproduces it
+            # exactly); after it, per-model rows carry each model's OWN day-of
+            # mean and same-day trades deliberately write NO ensemble row —
+            # without the cap their AVG leaks day-of-lead samples into the
+            # combined-error pool, re-opening the sigma self-sharpening loop
+            # the same-day exclusion exists to prevent (review 2026-07-20).
             legacy = c.execute(
                 f"""SELECT city, target_date, AVG(error) FROM bias
-                    WHERE variable=? AND model NOT IN ('ensemble','station'){where_city}
+                    WHERE variable=? AND model NOT IN ('ensemble','station')
+                      AND target_date < '2026-07-10'{where_city}
                     GROUP BY city, target_date""",
                 args,
             ).fetchall()
@@ -683,6 +714,7 @@ def get_ensemble_forecast(
     target_date: date,
     models: Optional[List[str]] = None,
     use_bias_correction: bool = True,
+    allow_intraday: bool = True,
 ) -> Optional[EnsembleForecast]:
     if models is None:
         models = settings.ensemble_model_list
@@ -744,7 +776,11 @@ def get_ensemble_forecast(
     # observed high-temp-so-far, the realized high is bounded below by it.
     # Tighten the ensemble around (max-so-far, ensemble-of-remaining) to
     # reduce variance in the final hours.
-    if target_date == date.today():
+    # allow_intraday=False: callers needing a PURE day-ahead mean (the daily
+    # forecast logger) — the clamp compares against box-LOCAL today, so on a
+    # tz-ahead-of-UTC box "UTC tomorrow" can equal local today and silently
+    # contaminate a snapshot that first-write-wins then makes permanent.
+    if allow_intraday and target_date == date.today():
         intraday = _intraday_high_so_far(lat, lon)
         if intraday is not None:
             # Discard members that are below what already happened.

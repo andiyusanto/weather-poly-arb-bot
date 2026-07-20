@@ -76,29 +76,68 @@ def test_resolve_skips_future_and_recent_targets(tmp_path: Path) -> None:
         assert br.resolve_forecast_logs() == 0
 
 
-def test_resolve_never_overwrites_trade_rows(tmp_path: Path) -> None:
+def test_resolve_never_overwrites_om_trade_row(tmp_path: Path) -> None:
     store = BiasStore(tmp_path / "b.db")
     target = _log_past_snapshot(store, mean=90.0)
-    # a trade already recorded ground truth for this (city, date)
-    store.record(city="Manila", model="ensemble", variable="temperature",
-                 target_date=date.fromisoformat(target),
-                 forecast_mean=88.0, observed=91.0)
+    # a trade already recorded BOTH ground-truth rows for this (city, date)
+    for model, obs in (("ensemble", 91.0), ("station", 92.0)):
+        store.record(city="Manila", model=model, variable="temperature",
+                     target_date=date.fromisoformat(target),
+                     forecast_mean=88.0, observed=obs)
     with patch.object(br, "_bias_store", store), \
          patch.object(br._geo, "get", side_effect=_geo_stub), \
-         patch.object(br, "_fetch_observed", return_value=32.6):
-        assert br.resolve_forecast_logs() == 0  # nothing pending
+         patch.object(br, "_fetch_observed", return_value=32.6), \
+         patch("src.station_obs.station_for_city", return_value="RPLL"), \
+         patch("src.station_obs.fetch_station_daily_max_f", return_value=99.0):
+        assert br.resolve_forecast_logs() == 0  # both legs already present
     with sqlite3.connect(store._db) as c:
         fm = c.execute("SELECT forecast_mean FROM bias WHERE model='ensemble'").fetchone()[0]
-    assert fm == 88.0  # trade row untouched
+        so = c.execute("SELECT observed FROM bias WHERE model='station'").fetchone()[0]
+    assert fm == 88.0 and so == 92.0  # trade rows untouched, not 99.0
 
 
-def test_resolve_tolerates_missing_observation(tmp_path: Path) -> None:
+def test_resolve_retries_only_missing_station_leg(tmp_path: Path) -> None:
+    # OM row already written (prior pass), station lost to an IEM failure:
+    # the station leg must be retried WITHOUT rewriting the OM row.
+    store = BiasStore(tmp_path / "b.db")
+    target = _log_past_snapshot(store, mean=90.0)
+    store.record(city="Manila", model="ensemble", variable="temperature",
+                 target_date=date.fromisoformat(target),
+                 forecast_mean=90.0, observed=90.5)
+    with patch.object(br, "_bias_store", store), \
+         patch.object(br._geo, "get", side_effect=_geo_stub), \
+         patch.object(br, "_fetch_observed", return_value=99.0) as om, \
+         patch("src.station_obs.station_for_city", return_value="RPLL"), \
+         patch("src.station_obs.fetch_station_daily_max_f", return_value=91.4):
+        assert br.resolve_forecast_logs() == 1
+        om.assert_not_called()  # OM leg not needed → no refetch
+    with sqlite3.connect(store._db) as c:
+        rows = {m: o for m, o in c.execute("SELECT model, observed FROM bias")}
+    assert rows["ensemble"] == 90.5   # untouched
+    assert rows["station"] == 91.4    # newly written
+
+
+def test_resolve_stays_pending_when_both_legs_fail(tmp_path: Path) -> None:
     store = BiasStore(tmp_path / "b.db")
     _log_past_snapshot(store)
     with patch.object(br, "_bias_store", store), \
          patch.object(br._geo, "get", side_effect=_geo_stub), \
-         patch.object(br, "_fetch_observed", return_value=None):
-        assert br.resolve_forecast_logs() == 0  # stays pending for a later pass
+         patch.object(br, "_fetch_observed", return_value=None), \
+         patch("src.station_obs.station_for_city", return_value="RPLL"), \
+         patch("src.station_obs.fetch_station_daily_max_f", return_value=None):
+        assert br.resolve_forecast_logs() == 0  # both legs failed → still pending
+    with sqlite3.connect(store._db) as c:
+        assert c.execute("SELECT count(*) FROM bias").fetchone()[0] == 0
+
+
+def test_resolve_abandons_snapshots_past_max_age(tmp_path: Path) -> None:
+    store = BiasStore(tmp_path / "b.db")
+    _log_past_snapshot(store, days_ago=br.RESOLVE_MAX_AGE_DAYS + 5)
+    with patch.object(br, "_bias_store", store), \
+         patch.object(br._geo, "get", side_effect=_geo_stub), \
+         patch.object(br, "_fetch_observed", return_value=32.6) as om:
+        assert br.resolve_forecast_logs() == 0
+        om.assert_not_called()  # too old → never fetched
 
 
 def test_snapshot_all_cities_includes_station_mapped(tmp_path: Path) -> None:
@@ -111,3 +150,31 @@ def test_snapshot_all_cities_includes_station_mapped(tmp_path: Path) -> None:
          patch("src.forecast.get_ensemble_forecast",
                return_value=SimpleNamespace(mean_f=90.5)):
         assert br.snapshot_daily_forecasts() == 3  # union, deduped
+
+
+def test_snapshot_records_zero_fahrenheit_mean(tmp_path: Path) -> None:
+    # 0.0°F is a real winter high (Moscow/Helsinki/Toronto), not "missing".
+    store = BiasStore(tmp_path / "b.db")
+    with patch.object(br, "_bias_store", store), \
+         patch.object(br._geo, "get", side_effect=_geo_stub), \
+         patch.object(settings, "city_allowlist", "moscow"), \
+         patch.object(settings, "forecast_log_all_cities", False), \
+         patch("src.forecast.get_ensemble_forecast",
+               return_value=SimpleNamespace(mean_f=0.0)):
+        assert br.snapshot_daily_forecasts() == 1
+    with sqlite3.connect(store._db) as c:
+        assert c.execute("SELECT forecast_mean FROM forecast_log").fetchone()[0] == 0.0
+
+
+def test_snapshot_passes_allow_intraday_false(tmp_path: Path) -> None:
+    # The logger must request a PURE day-ahead mean (no intraday clamp), else
+    # a tz-ahead box permanently contaminates first-write-wins snapshots.
+    store = BiasStore(tmp_path / "b.db")
+    with patch.object(br, "_bias_store", store), \
+         patch.object(br._geo, "get", side_effect=_geo_stub), \
+         patch.object(settings, "city_allowlist", "manila"), \
+         patch.object(settings, "forecast_log_all_cities", False), \
+         patch("src.forecast.get_ensemble_forecast",
+               return_value=SimpleNamespace(mean_f=90.0)) as gef:
+        br.snapshot_daily_forecasts()
+        assert gef.call_args.kwargs.get("allow_intraday") is False
