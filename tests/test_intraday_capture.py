@@ -12,11 +12,20 @@ import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import src.intraday_capture as ic
 from config.settings import settings
 from src.polymarket_client import MarketType, WeatherBucket, WeatherMarket
 from src.station_obs import fetch_station_intraday_state
+
+_MANILA = ZoneInfo("Asia/Manila")
+
+
+def _manila_today() -> date:
+    # The gate compares target_date to the city's real local date, so fixtures
+    # must anchor to "now" the same way the code does.
+    return datetime.now(timezone.utc).astimezone(_MANILA).date()
 
 
 class _FakeResp:
@@ -99,7 +108,9 @@ def test_one_bad_row_does_not_discard_the_day() -> None:
 
 # ── capture writer ──────────────────────────────────────────────────────────
 
-def _market(target: date = date(2026, 7, 7), suffix: str = "") -> WeatherMarket:
+def _market(target: date | None = None, suffix: str = "") -> WeatherMarket:
+    if target is None:
+        target = _manila_today()  # the city's local today → passes the gate
     buckets = [
         WeatherBucket(token_id=f"tok_lo{suffix}", outcome_label="85-89°F", lower=85.0, upper=90.0,
                       best_ask=0.20, best_bid=0.16, volume_usdc=800.0),
@@ -110,7 +121,7 @@ def _market(target: date = date(2026, 7, 7), suffix: str = "") -> WeatherMarket:
         market_id=f"mkt{suffix or '1'}",
         question=f"Will the highest temperature in Manila be 90-94°F on {target.isoformat()}?",
         city="Manila", target_date=target,
-        resolution_datetime=datetime.now(timezone.utc) + timedelta(hours=6),
+        resolution_datetime=datetime.now(timezone.utc).replace(hour=12, minute=0),
         market_type=MarketType.TEMPERATURE, buckets=buckets, total_volume_usdc=2000.0,
     )
 
@@ -171,23 +182,26 @@ def test_capture_survives_missing_station_obs(tmp_path: Path) -> None:
 
 
 def test_obs_cache_keyed_by_city_and_date(tmp_path: Path) -> None:
-    # same city, two dates in the window: each date's rows must carry ITS OWN
-    # running max, not the first-fetched date's (the (city,date) cache-key fix).
+    # same city, two qualifying dates (local today + yesterday): each date's
+    # rows must carry ITS OWN running max, not the first-fetched date's (the
+    # (city,date) cache-key fix).
     db = tmp_path / "intraday.db"
-    m7 = _market(date(2026, 7, 7), suffix="_d7")
-    m8 = _market(date(2026, 7, 8), suffix="_d8")
+    today = _manila_today()
+    yesterday = today - timedelta(days=1)
+    m_today = _market(today, suffix="_t")
+    m_yday = _market(yesterday, suffix="_y")
     per_date = {
-        date(2026, 7, 7): {"running_max_f": 91.4, "peak_hour_local": 14.0,
-                           "last_hour_local": 18.0, "n_reports": 12,
-                           "hours_since_peak": 4.0, "locked": True},
-        date(2026, 7, 8): {"running_max_f": 85.0, "peak_hour_local": 13.0,
-                           "last_hour_local": 18.0, "n_reports": 12,
-                           "hours_since_peak": 5.0, "locked": False},
+        today: {"running_max_f": 91.4, "peak_hour_local": 14.0,
+                "last_hour_local": 18.0, "n_reports": 12,
+                "hours_since_peak": 4.0, "locked": True},
+        yesterday: {"running_max_f": 85.0, "peak_hour_local": 13.0,
+                    "last_hour_local": 18.0, "n_reports": 12,
+                    "hours_since_peak": 5.0, "locked": False},
     }
     with patch.object(settings, "intraday_capture", True), \
          patch.object(settings, "city_allowlist", "Manila"), \
          patch.object(ic, "INTRADAY_DB", db), \
-         patch.object(ic, "fetch_weather_markets", return_value=[m7, m8]), \
+         patch.object(ic, "fetch_weather_markets", return_value=[m_today, m_yday]), \
          patch.object(ic, "station_for_city", return_value="RPLL"), \
          patch.object(ic._geo, "get", return_value={"timezone": "Asia/Manila"}), \
          patch.object(ic, "fetch_station_intraday_state",
@@ -200,4 +214,20 @@ def test_obs_cache_keyed_by_city_and_date(tmp_path: Path) -> None:
     got = dict(conn.execute(
         "SELECT target_date, running_max_f FROM intraday_snapshots GROUP BY target_date"
     ).fetchall())
-    assert got == {"2026-07-07": 91.4, "2026-07-08": 85.0}
+    assert got == {today.isoformat(): 91.4, yesterday.isoformat(): 85.0}
+
+
+def test_future_dated_market_excluded(tmp_path: Path) -> None:
+    # a market for a future local day (weather hasn't happened) must be dropped
+    db = tmp_path / "intraday.db"
+    future = _market(_manila_today() + timedelta(days=3), suffix="_fut")
+    with patch.object(settings, "intraday_capture", True), \
+         patch.object(settings, "city_allowlist", "Manila"), \
+         patch.object(ic, "INTRADAY_DB", db), \
+         patch.object(ic, "fetch_weather_markets", return_value=[future]), \
+         patch.object(ic, "station_for_city", return_value="RPLL"), \
+         patch.object(ic._geo, "get", return_value={"timezone": "Asia/Manila"}), \
+         patch.object(ic, "fetch_station_intraday_state", return_value=None), \
+         patch.object(ic, "fetch_book_depth", return_value={}):
+        n = ic.capture_intraday_books()
+    assert n == 0

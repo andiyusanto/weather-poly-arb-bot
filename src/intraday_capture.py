@@ -8,8 +8,8 @@ window, i.e. after the daily max is meteorologically locked but while the market
 is still open. Pairing that book snapshot with the (near-certain) station
 outcome is what will later prove or kill a same-day intraday trading mode.
 
-For each allowlist TEMPERATURE market resolving today, on each capture tick, we
-snapshot:
+For each allowlist TEMPERATURE market whose settlement day is the current (or
+just-ended) local calendar day for its city, on each capture tick, we snapshot:
   - the station's running daily max + a real-time "locked" flag
     (:func:`station_obs.fetch_station_intraday_state`)
   - every bucket's best ask/bid, NO ask, top-of-book depth, volume, and whether
@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from loguru import logger
 
@@ -98,19 +99,45 @@ def _contains(bucket: WeatherBucket, value: Optional[float]) -> Optional[int]:
     return int(bucket.lower <= value < bucket.upper)
 
 
+def _city_local_date(city: str, now_utc: datetime) -> Optional[date_type]:
+    """The city's current local calendar date, or None if its tz is unknown."""
+    geo = _geo.get(city.strip())
+    tzname = geo.get("timezone") if geo else None
+    if not tzname:
+        return None
+    try:
+        return now_utc.astimezone(ZoneInfo(tzname)).date()
+    except Exception:  # unknown/invalid tz name — treat as unresolvable
+        return None
+
+
 def _qualifying_markets(markets: list[WeatherMarket]) -> list[WeatherMarket]:
-    """Allowlist temperature markets resolving within the capture window."""
+    """
+    Allowlist temperature markets whose settlement day is the current — or the
+    just-ended — LOCAL calendar day for their city.
+
+    NOT gated on resolution_datetime: Polymarket's `endDate` for these markets
+    is a nominal noon-UTC timestamp, and the market stays tradeable for hours
+    past it (observed 2026-07-20: today's market still listed 3.3h after its
+    endDate). A "July 20" market settles on the station's LOCAL July-20 max
+    (the validated ground-truth convention), so we gate on target_date == the
+    city's local today (captures the whole in-progress day, including the
+    locked-and-still-trading evening) or local yesterday (the just-ended day
+    still listed past its nominal resolution). Future days are excluded — their
+    weather hasn't happened, so `locked` would always be 0.
+    """
     allow = settings.city_allowlist_set
+    now_utc = datetime.now(timezone.utc)
     out: list[WeatherMarket] = []
     for m in markets:
         if m.market_type != MarketType.TEMPERATURE:
             continue
         if allow and m.city.strip().lower() not in allow:
             continue
-        if not m.resolution_datetime:
+        local_today = _city_local_date(m.city, now_utc)
+        if local_today is None:
             continue
-        h = hours_until(m.resolution_datetime)
-        if 0 < h <= settings.intraday_capture_max_hours:
+        if m.target_date in (local_today, local_today - timedelta(days=1)):
             out.append(m)
     return out
 
@@ -138,7 +165,7 @@ def capture_intraday_books() -> int:
 
     qualifying = _qualifying_markets(markets)
     if not qualifying:
-        logger.info("intraday capture: no allowlist temperature markets in window")
+        logger.info("intraday capture: no allowlist temperature markets for the current local day")
         return 0
 
     # Fetch each (city, date) station state once (IEM is rate-limited; many

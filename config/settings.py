@@ -181,8 +181,6 @@ class Settings(BaseSettings):
     # (`python run.py capture-intraday`), not the trading process. Default off;
     # turning it on cannot touch the frozen verdict funnel.
     intraday_capture: bool = False
-    # Only capture markets resolving within this many hours (i.e. "today").
-    intraday_capture_max_hours: float = 18.0
 
     # ── Overround alert ──────────────────────────────────────────────────────
     # Alert (Telegram + WARNING log) when an event's YES asks sum to at least
