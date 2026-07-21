@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import time
 from datetime import date as date_type, datetime, timedelta
 from typing import Optional
 
@@ -81,12 +82,16 @@ def station_for_city(city: str) -> Optional[str]:
     return entry.get("icao") if isinstance(entry, dict) else None
 
 
-def _fetch_iem_csv(icao: str, target: date_type, tz: str) -> Optional[str]:
+def _fetch_iem_csv(icao: str, target: date_type, tz: str, *, attempts: int = 3) -> Optional[str]:
     """
     Raw IEM ASOS onlycomma response for a station over the local day
     ``[target, target+1)``. Shared by the daily-max and intraday readers so the
-    request params and HTTP error handling live in one place. Returns the CSV
-    text, or None on missing args / HTTP failure (best-effort, never raises).
+    request params and HTTP error handling live in one place.
+
+    IEM aggressively rate-limits (HTTP 429); retries with backoff (longer for a
+    429) so a transient throttle doesn't cost us the observation — the bias
+    recorder and the intraday capture both depend on this. Returns the CSV text,
+    or None on missing args / exhausted retries (best-effort, never raises).
     """
     if not icao or not tz:
         return None
@@ -97,14 +102,22 @@ def _fetch_iem_csv(icao: str, target: date_type, tz: str) -> Optional[str]:
         "year2": end.year, "month2": end.month, "day2": end.day,
         "tz": tz, "format": "onlycomma", "latlon": "no", "missing": "empty",
     }
-    try:
-        with httpx.Client(timeout=25) as client:
-            resp = client.get(IEM_URL, params=params)
-            resp.raise_for_status()
-            return resp.text
-    except httpx.HTTPError as e:
-        logger.warning(f"IEM fetch failed for {icao}/{target}: {e}")
-        return None
+    for attempt in range(attempts):
+        try:
+            with httpx.Client(timeout=25) as client:
+                resp = client.get(IEM_URL, params=params)
+                resp.raise_for_status()
+                return resp.text
+        except httpx.HTTPError as e:
+            if attempt + 1 >= attempts:
+                logger.warning(f"IEM fetch failed for {icao}/{target}: {e}")
+                return None
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            backoff = (3.0 if status == 429 else 1.0) * (attempt + 1)
+            logger.debug(f"IEM retry {attempt + 1}/{attempts} for {icao}/{target} "
+                         f"(status={status}); backoff {backoff:.0f}s")
+            time.sleep(backoff)
+    return None
 
 
 def fetch_station_daily_max_f(icao: str, target: date_type, tz: str) -> Optional[float]:

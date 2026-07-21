@@ -14,6 +14,8 @@ from pathlib import Path
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import httpx
+
 import src.intraday_capture as ic
 from config.settings import settings
 from src.polymarket_client import MarketType, WeatherBucket, WeatherMarket
@@ -88,6 +90,21 @@ def test_pre_noon_max_locks_in_afternoon() -> None:
 
 def test_intraday_state_none_on_empty() -> None:
     assert _fetch_state("station,valid,tmpf") is None
+
+
+def test_iem_fetch_retries_then_succeeds() -> None:
+    # a transient IEM error (e.g. 429) must be retried, not lost — the bias
+    # recorder and the capture both depend on this. sleep patched → instant.
+    good = _csv("2026-07-07", [(10, 80), (14, 91.4), (16, 88), (18, 83)])
+    with patch("src.station_obs.httpx.Client") as cli, \
+         patch("src.station_obs.time.sleep") as slept:
+        cli.return_value.__enter__.return_value.get.side_effect = [
+            httpx.ConnectError("boom"),   # first attempt fails
+            _FakeResp(good),              # retry succeeds
+        ]
+        st = fetch_station_intraday_state("RPLL", date(2026, 7, 7), "Asia/Manila")
+    assert st is not None and st["running_max_f"] == 91.4
+    assert slept.call_count == 1          # backed off exactly once before the retry
 
 
 def test_one_bad_row_does_not_discard_the_day() -> None:
@@ -201,6 +218,7 @@ def test_obs_cache_keyed_by_city_and_date(tmp_path: Path) -> None:
     with patch.object(settings, "intraday_capture", True), \
          patch.object(settings, "city_allowlist", "Manila"), \
          patch.object(ic, "INTRADAY_DB", db), \
+         patch("src.intraday_capture.time.sleep"), \
          patch.object(ic, "fetch_weather_markets", return_value=[m_today, m_yday]), \
          patch.object(ic, "station_for_city", return_value="RPLL"), \
          patch.object(ic._geo, "get", return_value={"timezone": "Asia/Manila"}), \

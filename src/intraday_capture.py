@@ -29,6 +29,7 @@ skipped; the capture never raises.
 from __future__ import annotations
 
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date as date_type, datetime, timedelta, timezone
 from typing import Optional
@@ -48,6 +49,9 @@ from src.station_obs import fetch_station_intraday_state, station_for_city
 from src.utils import GeoCache, hours_until
 
 _geo = GeoCache(CITIES_CACHE_DB)
+
+# Seconds to wait between per-station IEM calls, to stay under its rate limit.
+_IEM_SPACING_S = 0.6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS intraday_snapshots (
@@ -173,6 +177,7 @@ def capture_intraday_books() -> int:
     # so a city with two dates in the window never reuses the wrong day's max.
     # None on failure — we still log the book with null obs.
     obs_by_key: dict[tuple[str, object], Optional[dict]] = {}
+    fetched = 0
     for m in qualifying:
         key = (m.city.strip().lower(), m.target_date)
         if key in obs_by_key:
@@ -180,10 +185,13 @@ def capture_intraday_books() -> int:
         icao = station_for_city(m.city.strip())
         geo = _geo.get(m.city.strip())
         tz = geo.get("timezone") if geo else None
-        obs_by_key[key] = (
-            fetch_station_intraday_state(icao, m.target_date, tz)
-            if (icao and tz) else None
-        )
+        if icao and tz:
+            if fetched:
+                time.sleep(_IEM_SPACING_S)  # be polite to IEM between stations
+            obs_by_key[key] = fetch_station_intraday_state(icao, m.target_date, tz)
+            fetched += 1
+        else:
+            obs_by_key[key] = None
 
     # Collect every (market, bucket) leg, fetch depth concurrently (bounded).
     legs = [(m, b) for m in qualifying for b in m.buckets if b.token_id]
