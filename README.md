@@ -83,6 +83,13 @@ every order ~$2–3.40), and treat `❌ LIVE order failed` alerts as information
   combined mean was duplicated under every model name, making per-model bias a
   no-op and BMA weights unfittable). Same-day trades skip the ensemble sigma
   row (intraday-clamped means would self-sharpen the EMOS sigma).
+- **Intraday book capture** (observation-only; flag-gated `INTRADAY_CAPTURE`,
+  writes a **separate** `data/intraday_book.db`, runs from its **own** cron —
+  never in the scan→trade loop): each tick snapshots the order book + running
+  station max for allowlist temperature markets on their local settlement day,
+  to collect the "market half" of the peak-passed edge (below). Gated on
+  `target_date` vs the city's local date, **not** the nominal noon-UTC `endDate`
+  (markets trade for hours past it). `python run.py capture-intraday`.
 
 **Forecast engines**
 - **EMOS-lite engine** behind `FORECAST_ENGINE=kde|emos` (default `kde`):
@@ -101,6 +108,27 @@ every order ~$2–3.40), and treat `❌ LIVE order failed` alerts as information
 - `scripts/analyze_history.py`: segment-calibration study with pre-registered
   primary hypothesis, monthly train/holdout split, and 0/2/5¢ cost sensitivity.
   Null-validated on synthetic efficient-market data.
+
+**Edge research (2026-07-20)** — offline studies against 727 settlement-station
+residuals + per-model archives; full write-ups in `docs/`:
+- **Settlement-station ground truth** — markets settle on the named airport
+  station's local-day max, not the Open-Meteo grid (grid lands in the winning
+  bucket only 26% of the time). Station rows recorded in parallel; flip with
+  `GROUND_TRUTH_SOURCE=station` post-verdict.
+- **Spread-skill (candidate)** — cross-model ensemble spread predicts error
+  (RMSE 1.9 / 2.6 / 3.2 by spread tercile); a spread-conditional σ beats flat σ
+  out-of-sample. → EMOS σ = f(spread), behind the EMOS flag, post-verdict.
+- **Residual shape (candidate)** — the 727 residuals are left-skewed (−0.61) and
+  fat-tailed (3σ mass ≈ 4× Gaussian); a Gaussian EMOS misprices the tails. →
+  empirical / skew-normal bucket scoring, post-verdict.
+- **Peak-passed (under capture)** — the daily max locks ~16:00 local while the
+  market trades on; the intraday capture is collecting the market half to prove
+  or kill a same-day intraday mode.
+- **Airport relocation (killed)** — forecasting the airport gridpoint instead of
+  city-center does not shrink the settlement σ for traded cities (≤0%).
+
+See [`docs/edge_candidates_2026-07-20.md`](docs/edge_candidates_2026-07-20.md)
+and [`docs/airport_coord_backtest.md`](docs/airport_coord_backtest.md).
 
 ---
 
@@ -144,17 +172,22 @@ weather-poly-arb-bot/
 │   └── settings.py          # All config via pydantic-settings + .env
 ├── src/
 │   ├── __init__.py
-│   ├── main.py              # Typer CLI: scan / trade / backtest / show-trades
+│   ├── main.py              # Typer CLI: scan / trade / backtest / capture-intraday / …
 │   ├── scanner.py           # Orchestrator — routes to correct forecast by market type
-│   ├── forecast.py          # KDE (temp/wind) + empirical (precip/snow) probability engine
+│   ├── forecast.py          # KDE + EMOS-lite (temp/wind) + empirical (precip/snow); BiasStore
 │   ├── polymarket_client.py # MarketType enum, WeatherBucket, Gamma + CLOB client
 │   ├── strategy.py          # Duck-typed EV calc + Kelly sizing for all market types
 │   ├── backtester.py        # Monte Carlo + grid-search, per-type breakdown
 │   ├── trader.py            # Execution + Telegram alerts + trade recording
+│   ├── bias_recorder.py     # Records observed−forecast + daily forecast snapshots
+│   ├── station_obs.py       # Settlement-station METAR (IEM ASOS): daily-max + intraday state
+│   ├── calibration.py       # Empirical probability-calibration curve
+│   ├── intraday_capture.py  # Observation-only peak-passed book capture (separate DB, own cron)
 │   └── utils.py             # Logging, geocache, trade DB, helpers
-├── tests/
-│   └── test_wind_forecast.py  # Unit tests for wind speed forecast logic
-├── data/                    # SQLite databases (auto-created)
+├── tests/                   # pytest suite (forecast, strategy, station truth, intraday capture, …)
+├── scripts/                 # Research/ops: settlement audit, station-map build, history fetch, …
+├── docs/                    # Edge-research write-ups (see Changelog → Edge research)
+├── data/                    # SQLite: trades / bias_corrections / cities_cache / intraday_book (auto-created)
 ├── logs/                    # Rotating log files
 ├── setup.py                 # One-time credential generator (pre_setup.env → .env)
 ├── approve_usdc.py          # On-chain USDC approval for Polymarket spenders
@@ -762,6 +795,38 @@ journalctl -u polymarket-resolve.service -n 50   # last run output
 - Win rate ≥ 55% on ≥ 30 resolved trades
 - Total P&L positive
 - No single city driving all the edge (diversification check)
+
+#### `python run.py capture-intraday` — peak-passed book capture (research, observation-only)
+
+Snapshots the order book + running settlement-station max for allowlist
+temperature markets on their **current local settlement day**, into a separate
+`data/intraday_book.db`. It **places no orders** and is **not** part of the
+scan→trade loop — it collects the "market half" of the peak-passed edge: once the
+daily max locks (~16:00 local) the outcome is determined, yet the market keeps
+trading. Pairing each book snapshot with the near-certain station outcome is what
+will later prove or kill a same-day intraday mode.
+
+- Does nothing unless `INTRADAY_CAPTURE=true`.
+- Gated on `target_date` vs the city's local date (today or just-ended), **not**
+  the nominal noon-UTC `endDate` — these markets stay tradeable for hours past it.
+- Best-effort: IEM rate-limits (429) are retried with backoff; a throttled city
+  logs the book with null station state rather than failing.
+
+Run it on its **own** ~30-min cron (separate from the resolve cron; same
+venv-python + absolute-path rules apply):
+
+```bash
+*/30 * * * * cd /home/yusantoandi/weather-poly-arb-bot && INTRADAY_CAPTURE=true /home/yusantoandi/weather-poly-arb-bot/.venv/bin/python run.py capture-intraday >> logs/intraday.log 2>&1
+```
+
+The rows worth watching — a determined winner the market is still selling below fair:
+
+```bash
+sqlite3 -header -column data/intraday_book.db \
+"SELECT captured_at, city, ROUND(running_max_f,1) rmax, bucket_label, best_ask, ROUND(ask_depth_usdc,0) depth FROM intraday_snapshots WHERE locked=1 AND contains_running_max=1 AND best_ask BETWEEN 0.02 AND 0.90 ORDER BY best_ask;"
+```
+
+> A **research probe, not a trading path** — own process, own DB, never touches the trade funnel. See Changelog → *Edge research → Peak-passed*.
 
 #### `python run.py side-pnl` — per-side performance & CI verdict
 
